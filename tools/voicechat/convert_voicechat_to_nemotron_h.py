@@ -360,6 +360,30 @@ def main() -> None:
 
     # ---------------------------------------------------------------- vocab
 
+    # VoiceChat retrains the base tokenizer's special tokens. The reference
+    # config.json says eos is 12 and pad is 0, but the embedded NeMo config
+    # (stt.model.override_tokens) says eos is </s> and pad is <SPECIAL_12>,
+    # which is token 12. Writing the base ids would make llama.cpp stop on the
+    # model's pad, i.e. on the first silent frame.
+    overrides = {}
+    try:
+        model_cfg = json.loads(src.kv["voicechat.config.model"])
+        overrides = model_cfg["stt"]["model"]["override_tokens"]
+    except (KeyError, ValueError):
+        logger.warning("no stt.model.override_tokens in the source, using the reference ids")
+
+    if overrides:
+        by_text = {t: i for i, t in enumerate(voc["tokens"])}
+        for key, name in (("bos_token", "bos_id"), ("eos_token", "eos_id"), ("pad_token", "pad_id")):
+            tok = overrides.get(key)
+            if tok is None:
+                continue
+            if tok not in by_text:
+                raise SystemExit(f"override_tokens.{key} = {tok!r} is not in the tokenizer")
+            if voc[name] != by_text[tok]:
+                logger.info("override %s: %s -> %s (%r)", name, voc[name], by_text[tok], tok)
+            voc[name] = by_text[tok]
+
     w.add_tokenizer_model("gpt2")
     w.add_tokenizer_pre(TOKENIZER_PRE)
     w.add_token_list(voc["tokens"])

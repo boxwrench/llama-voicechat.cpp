@@ -1248,7 +1248,7 @@ bool mtmd_audio_preprocessor_parakeet::preprocess(const float * samples,
     }
 
     // Per-feature normalization (only on valid frames)
-    {
+    if (norm_per_feature) {
         const double eps = 1e-5;
         int valid_frames = n_samples_in / frame_step;
 

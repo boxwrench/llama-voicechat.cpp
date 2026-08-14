@@ -425,6 +425,19 @@
 #define TN_CONV_NORM_MEAN        "%s.blk.%d.conv_norm_mean"
 #define TN_CONV_NORM_VAR         "%s.blk.%d.conv_norm_var"
 
+// voicechat
+#define TN_MM_AUDIO_PROJ         "mm.a.proj.%s"
+
+// voicechat conv subsampling: three causal stride-2 stages, each of which maps
+// L to floor(L/2)+1 (NeMo calc_length with all_paddings == kernel_size)
+static inline int clip_voicechat_n_frames_out(int n_mel_frames) {
+    int n = n_mel_frames;
+    for (int i = 0; i < 3; ++i) {
+        n = n / 2 + 1;
+    }
+    return n;
+}
+
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
@@ -492,6 +505,7 @@ enum projector_type {
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_MUSE_GLIMMER,
+    PROJECTOR_TYPE_VOICECHAT,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -554,6 +568,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+    { PROJECTOR_TYPE_VOICECHAT,         "voicechat"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

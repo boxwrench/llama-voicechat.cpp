@@ -1101,6 +1101,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_parakeet>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_VOICECHAT:
+            {
+                builder = std::make_unique<clip_graph_voicechat>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_GRANITE4_VISION:
             {
                 builder = std::make_unique<clip_graph_granite4_vision>(ctx, img);
@@ -1451,6 +1455,22 @@ struct clip_model_loader {
                         get_u32(KEY_A_CONV_KERNEL_SIZE,       hparams.audio_conv_kernel_size);
                         GGML_ASSERT(hparams.audio_conv_kernel_size > 0 && hparams.audio_conv_kernel_size % 2 == 1 &&
                             "audio_conv_kernel_size must be a positive odd integer");
+                        hparams.audio_chunk_len    = 0;
+                        hparams.audio_sample_rate  = 16000;
+                        hparams.audio_n_fft        = 512;
+                        hparams.audio_window_len   = 400;
+                        hparams.audio_hop_len      = 160;
+                    } break;
+                case PROJECTOR_TYPE_VOICECHAT:
+                    {
+                        get_u32(KEY_AUDIO_SUBSMPL_FACTOR, hparams.subsampling_factor);
+                        GGML_ASSERT(hparams.subsampling_factor == 8 &&
+                            "subsampling_factor must match the conv strides in clip_graph_voicechat::build()");
+                        get_u32(KEY_A_CONV_KERNEL_SIZE, hparams.audio_conv_kernel_size);
+                        GGML_ASSERT(hparams.audio_conv_kernel_size > 0 &&
+                            "audio_conv_kernel_size must be positive");
+                        // att_context_size[0]: frames of left context the attention sees
+                        get_u32(KEY_A_ATTN_WINDOW_SIZE, hparams.attn_window_size);
                         hparams.audio_chunk_len    = 0;
                         hparams.audio_sample_rate  = 16000;
                         hparams.audio_n_fft        = 512;
@@ -3251,6 +3271,47 @@ struct clip_model_loader {
                         layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
                     }
                 } break;
+            case PROJECTOR_TYPE_VOICECHAT:
+                {
+                    hparams.mel_filters = get_vector(TN_MEL_FILTERS);
+                    hparams.window      = get_vector(TN_WINDOW);
+
+                    for (int i : {0, 2, 3, 5, 6}) {
+                        model.pre_encode_conv_X_w[i] = get_tensor(string_format(TN_CONV1D, i, "weight"));
+                        model.pre_encode_conv_X_b[i] = get_tensor(string_format(TN_CONV1D, i, "bias"));
+                    }
+                    model.pre_encode_out_w = get_tensor(string_format(TN_PRE_ENCODE_OUT, "weight"));
+                    model.pre_encode_out_b = get_tensor(string_format(TN_PRE_ENCODE_OUT, "bias"));
+
+                    // the modality adapter is an identity, so the projector is one linear
+                    model.mm_0_w = get_tensor(string_format(TN_MM_AUDIO_PROJ, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_MM_AUDIO_PROJ, "bias"));
+
+                    for (int il = 0; il < hparams.n_layer; ++il) {
+                        auto & layer = model.layers[il];
+
+                        layer.linear_pos_w = get_tensor(string_format(TN_LINEAR_POS, prefix, il, "weight"));
+                        layer.pos_bias_u   = get_tensor(string_format(TN_POS_BIAS_U, prefix, il));
+                        layer.pos_bias_v   = get_tensor(string_format(TN_POS_BIAS_V, prefix, il));
+
+                        // conv module; conv_norm is a LayerNorm here, so no running stats
+                        layer.conv_pw1_w  = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "weight"));
+                        layer.conv_dw_w   = get_tensor(string_format(TN_CONV_DW,   prefix, il, "weight"));
+                        layer.conv_pw2_w  = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "weight"));
+                        layer.conv_norm_w = get_tensor(string_format(TN_CONV_NORM, prefix, il, "weight"));
+                        layer.conv_norm_b = get_tensor(string_format(TN_CONV_NORM, prefix, il, "bias"));
+                        layer.norm_conv_w = get_tensor(string_format(TN_NORM_CONV, prefix, il, "weight"));
+                        layer.norm_conv_b = get_tensor(string_format(TN_NORM_CONV, prefix, il, "bias"));
+
+                        // macaron feed forwards
+                        layer.ff_norm_w   = get_tensor(string_format(TN_FFN_NORM,   prefix, il, "weight"));
+                        layer.ff_norm_b   = get_tensor(string_format(TN_FFN_NORM,   prefix, il, "bias"));
+                        layer.ff_norm_1_w = get_tensor(string_format(TN_FFN_NORM_1, prefix, il, "weight"));
+                        layer.ff_norm_1_b = get_tensor(string_format(TN_FFN_NORM_1, prefix, il, "bias"));
+                        layer.ff_up_1_w   = get_tensor(string_format(TN_FFN_UP_1,   prefix, il, "weight"));
+                        layer.ff_down_1_w = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "weight"));
+                    }
+                } break;
             case PROJECTOR_TYPE_PARAKEET:
                 {
 
@@ -4173,6 +4234,10 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_PARAKEET:
             {
                 n_patches = (img->nx() + (params.subsampling_factor - 1)) / params.subsampling_factor;
+            } break;
+        case PROJECTOR_TYPE_VOICECHAT:
+            {
+                n_patches = clip_voicechat_n_frames_out(img->nx());
             } break;
         case PROJECTOR_TYPE_GEMMA4UA:
             {
@@ -5403,6 +5468,48 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     set_input_f32(rel_pos->name, pos);
                 }
             } break;
+        case PROJECTOR_TYPE_VOICECHAT:
+            {
+                GGML_ASSERT(imgs.entries.size() == 1);
+                ggml_tensor * attn_mask = ggml_graph_get_tensor(gf, "attn_mask");
+                const int   n_q        = attn_mask->ne[1];
+                const int   n_k        = attn_mask->ne[0];
+                const int   att_left   = hparams.attn_window_size;
+                const float mask_value = -1e30f;
+
+                // causal with a fixed left context: NeMo chunked_limited with
+                // att_context_size [att_left, 0] makes the chunk one frame wide
+                std::vector<float> mask_data(n_q * n_k);
+                for (int q = 0; q < n_q; ++q) {
+                    for (int k = 0; k < n_k; ++k) {
+                        const int d = q - k;
+                        mask_data[q * n_k + k] = (d >= 0 && d <= att_left) ? 0.0f : mask_value;
+                    }
+                }
+                set_input_f32(attn_mask->name, mask_data);
+
+                {
+                    const int   n_state   = hparams.n_embd;
+                    const int   d_half    = n_state / 2;
+                    const float log_10000 = logf(10000.0f);
+                    std::vector<float> freqs(d_half);
+                    for (int k = 0; k < d_half; ++k) {
+                        freqs[k] = expf(-(float(k * 2) * log_10000 / float(n_state)));
+                    }
+                    set_input_f32("pos_freqs", freqs);
+                }
+
+                {
+                    ggml_tensor * rel_pos = ggml_graph_get_tensor(gf, "rel_positions");
+                    const int window_size = rel_pos->ne[1];
+                    const int n_time      = (window_size + 1) / 2;
+                    std::vector<float> pos(window_size);
+                    for (int t = 0; t < window_size; ++t) {
+                        pos[t] = float(n_time - 1 - t);
+                    }
+                    set_input_f32(rel_pos->name, pos);
+                }
+            } break;
         case PROJECTOR_TYPE_GRANITE_SPEECH:
             {
                 const int context_size = ctx->model.hparams.audio_chunk_size;
@@ -5771,6 +5878,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:
             return ctx->model.mm_1_w->ne[1];
+        case PROJECTOR_TYPE_VOICECHAT:
+            return ctx->model.mm_0_w->ne[1];
         default:
             GGML_ABORT("Unknown projector type");
     }

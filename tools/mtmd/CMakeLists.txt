@@ -69,6 +69,7 @@ add_library(mtmd
             models/youtuvl.cpp
             models/yasa2.cpp
             models/parakeet.cpp
+            models/voicechat.cpp
             )
 
 set_target_properties(mtmd PROPERTIES

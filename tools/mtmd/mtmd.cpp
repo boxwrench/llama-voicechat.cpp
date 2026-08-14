@@ -964,6 +964,11 @@ struct mtmd_context {
                 {
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_parakeet>(ctx_a);
                 } break;
+            case PROJECTOR_TYPE_VOICECHAT:
+                {
+                    // same NeMo featurizer, but normalize is "NA" in this config
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_parakeet>(ctx_a, false);
+                } break;
             case PROJECTOR_TYPE_GEMMA4UA:
                 {
                     aud_beg = "<|audio>";

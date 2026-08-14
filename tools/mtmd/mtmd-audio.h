@@ -136,12 +136,16 @@ struct mtmd_audio_preprocessor_pockettts : mtmd_audio_preprocessor {
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
 };
 
+// NeMo AudioToMelSpectrogramPreprocessor. norm_per_feature is the `normalize`
+// setting: parakeet uses "per_feature", voicechat uses "NA" (no normalization).
 struct mtmd_audio_preprocessor_parakeet : mtmd_audio_preprocessor {
-    mtmd_audio_preprocessor_parakeet(clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) { }
+    mtmd_audio_preprocessor_parakeet(clip_ctx * ctx, bool norm_per_feature = true)
+        : mtmd_audio_preprocessor(ctx), norm_per_feature(norm_per_feature) { }
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
 
   private:
+    bool norm_per_feature;
     mtmd_audio_cache cache;
 
     static void worker_thread(int ith, const float * window_func, int window_size,
