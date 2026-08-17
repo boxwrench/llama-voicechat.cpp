@@ -22,6 +22,7 @@ on:
 
 env:
   CUDA_VERSION: '12.8'
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   windows-cuda:
@@ -29,6 +30,7 @@ jobs:
 
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: Clone
@@ -76,11 +78,6 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target llama-voicechat llama-cli
 
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          key: voicechat-release-windows-2022-x64-cuda-${{ env.CUDA_VERSION }}
-
       - name: Check llama-voicechat starts
         run: |
           .\build\bin\Release\llama-voicechat.exe --help | Select-Object -First 5
@@ -117,3 +114,9 @@ jobs:
             llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip `
             cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip `
             --clobber
+
+      - name: ccache-clear
+        continue-on-error: true
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: voicechat-release-windows-2022-x64-cuda-${{ env.CUDA_VERSION }}
