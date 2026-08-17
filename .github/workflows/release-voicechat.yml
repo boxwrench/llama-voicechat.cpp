@@ -78,6 +78,31 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target llama-voicechat llama-cli
 
+      # The CUDA runtime dlls first: the exe cannot even start without them,
+      # so they have to be in place before anything runs the binary.
+      - name: Collect Cuda runtime
+        run: |
+          Write-Host "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst = '.\cudart'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          # the redist layout moves between toolkit versions, so try all three
+          foreach ($src in @("${{ env.CUDA_PATH }}\bin", "${{ env.CUDA_PATH }}\lib", "${{ env.CUDA_PATH }}\bin\x64")) {
+            if (Test-Path $src) {
+              robocopy $src $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll | Out-Null
+            }
+          }
+          # robocopy returns non-zero on success; only >= 8 is a real failure
+          if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 }
+          $dlls = Get-ChildItem "$dst\*.dll"
+          if ($dlls.Count -eq 0) { throw "no CUDA runtime dlls found under ${{ env.CUDA_PATH }}" }
+          $dlls | Select-Object Name, Length | Format-Table -AutoSize
+          7z a cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip $dst\*
+
+      # Ship them inside the binary zip too, so one download runs on its own.
+      - name: Stage cudart next to the binaries
+        run: |
+          Copy-Item .\cudart\*.dll .\build\bin\Release\ -Force
+
       # Do not pipe into Select-Object here: -First N stops the pipeline early,
       # which kills the exe mid-write and fails the step on a good build.
       - name: Check llama-voicechat starts
@@ -93,17 +118,6 @@ jobs:
       - name: Pack binaries
         run: |
           7z a -snl llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip .\build\bin\Release\*
-
-      - name: Pack Cuda runtime
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{ env.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{ env.CUDA_PATH }}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          # robocopy exits non-zero on success, so do not let that fail the step
-          if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 }
-          7z a cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip $dst\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6

@@ -40,13 +40,13 @@ Download from [Releases](https://github.com/sansamour/llama-voicechat.cpp/releas
 | file | what |
 | --- | --- |
 | `llama-voicechat-bin-win-cpu-x64.zip` | Windows x64, CPU. Needs an AVX2 CPU. |
-| `llama-voicechat-bin-win-cuda-12.8-x64.zip` | Windows x64, CUDA 12. Self-contained. |
-| `cudart-llama-bin-win-cuda-12.8-x64.zip` | CUDA 12.8 runtime dlls, unzip on top of the CUDA build |
+| `llama-voicechat-bin-win-cuda-12.8-x64.zip` | Windows x64, CUDA 12.8. Self-contained: the CUDA runtime dlls are already in it. |
+| `cudart-llama-bin-win-cuda-12.8-x64.zip` | Just the CUDA 12.8 runtime dlls, on their own. Not needed unless you want them separately. |
 
 The CUDA build ships device code for sm_86, sm_89 and sm_120 (RTX 30xx, 40xx and
 50xx) and PTX from sm_50 up, so anything Maxwell or newer runs, with a JIT pause
-on the first launch if it is not one of those three. Take the CUDA zip **and**
-the cudart zip and unzip both into the same folder.
+on the first launch if it is not one of those three. You need an NVIDIA driver,
+but not the CUDA toolkit.
 
 Or [build it yourself](#building-from-source).
 
@@ -57,10 +57,11 @@ llama.cpp cannot load it as is - it carries NeMo tensor names and none of the KV
 metadata llama.cpp needs. Either take the converted files, or convert them
 yourself.
 
-**Converted, ready to run:**
+**Converted, ready to run** - they live in the `llamacpp/` folder of the same
+Hugging Face repo as the source file:
 
 ```bash
-hf download hoidhxd/NVIDIA-NemotronLabs-VoiceChat-11B-llamacpp-GGUF --local-dir voicechat
+hf download hoidhxd/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF --include "llamacpp/*" --local-dir .
 ```
 
 **Or convert them yourself** - see [From the source GGUF to the four files](#from-the-source-gguf-to-the-four-files).
@@ -81,7 +82,7 @@ The function head is found by name next to the model, so do not rename it.
 Ask a question from a wav and get a spoken answer back:
 
 ```bash
-llama-voicechat -m voicechat/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj voicechat/mmproj-voicechat-perception-Q4_0.gguf --tts voicechat/voicechat-tts-Q4_0.gguf --audio question.wav --tts-out answer.wav
+llama-voicechat -m llamacpp/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj llamacpp/mmproj-voicechat-perception-Q4_0.gguf --tts llamacpp/voicechat-tts-Q4_0.gguf --audio question.wav --tts-out answer.wav
 ```
 
 Set `VC_NO_BARGE=1` and `VC_FORCE_BOS=1` for anything push-to-talk. Without them
@@ -94,13 +95,13 @@ it can read a sentence out in the agent's own voice, which is how to make an
 English test clip:
 
 ```bash
-llama-voicechat -m voicechat/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj voicechat/mmproj-voicechat-perception-Q4_0.gguf --tts voicechat/voicechat-tts-Q4_0.gguf --say "What is the weather in Hanoi right now?" --tts-out question.wav
+llama-voicechat -m llamacpp/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj llamacpp/mmproj-voicechat-perception-Q4_0.gguf --tts llamacpp/voicechat-tts-Q4_0.gguf --say "What is the weather in Hanoi right now?" --tts-out question.wav
 ```
 
 Multi-turn, tool calls, one json object per line in and one event per line out:
 
 ```bash
-llama-voicechat -m voicechat/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj voicechat/mmproj-voicechat-perception-Q4_0.gguf --tts voicechat/voicechat-tts-Q4_0.gguf --serve
+llama-voicechat -m llamacpp/nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj llamacpp/mmproj-voicechat-perception-Q4_0.gguf --tts llamacpp/voicechat-tts-Q4_0.gguf --serve
 ```
 
 The full flag list, the event protocol, the environment variables and how each
