@@ -40,13 +40,14 @@ Download from [Releases](https://github.com/sansamour/llama-voicechat.cpp/releas
 | file | what |
 | --- | --- |
 | `llama-voicechat-bin-win-cpu-x64.zip` | Windows x64, CPU. Needs an AVX2 CPU. |
-| `llama-voicechat-bin-win-cuda-12.8-x64.zip` | Windows x64, CUDA 12.8. Self-contained: the CUDA runtime dlls are already in it. |
-| `cudart-llama-bin-win-cuda-12.8-x64.zip` | Just the CUDA 12.8 runtime dlls, on their own. Not needed unless you want them separately. |
+| `llama-voicechat-bin-win-cuda-12.8-x64.zip` | Windows x64, CUDA 12.8. |
+| `cudart-llama-bin-win-cuda-12.8-x64.zip` | The CUDA 12.8 runtime dlls. Unzip into the same folder as the CUDA build. |
 
 The CUDA build ships device code for sm_86, sm_89 and sm_120 (RTX 30xx, 40xx and
 50xx) and PTX from sm_50 up, so anything Maxwell or newer runs, with a JIT pause
-on the first launch if it is not one of those three. You need an NVIDIA driver,
-but not the CUDA toolkit.
+on the first launch if it is not one of those three. Take the CUDA zip **and**
+the cudart zip and unzip both into the same folder. You need an NVIDIA driver
+installed, but not the CUDA toolkit.
 
 Or [build it yourself](#building-from-source).
 
