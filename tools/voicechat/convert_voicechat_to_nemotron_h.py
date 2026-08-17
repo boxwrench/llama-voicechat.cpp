@@ -37,10 +37,20 @@ Usage
         --ref-dir ref_nano9b \
         -o nemotron_voicechat_11b-stt-llm-Q4_0.gguf
 
+The function head
+-----------------
+The duplex model has a second output projection, `function_head` (a copy of
+lm_head shape-wise), whose channel carries the turn-taking / tool-call tokens
+<SPECIAL_20> (sotc), <SPECIAL_21> (eotc) and <SPECIAL_22> (eotr). Its embedding
+is also part of the per-frame input sum, so llama-voicechat needs it to keep the
+LLM in distribution. llama.cpp rejects unknown tensors in a `nemotron_h` file,
+so it is written as a small side gguf, `<output>-function-head.gguf` by default,
+which llama-voicechat picks up by name next to the model.
+
 What is dropped
 ---------------
-Everything that is not the STT language model: perception encoder, RNN-T decoder
-and joint, function head, TTS backbone and audio codec. Those need a real
+Everything else that is not the STT language model: perception encoder, RNN-T
+decoder and joint, TTS backbone and audio codec. Those need a real
 `nemotron_voicechat` architecture in llama.cpp; this script is stage one.
 """
 
@@ -271,6 +281,9 @@ def main() -> None:
                     help="directory with config.json + tokenizer.json + tokenizer_config.json "
                          "from nvidia/NVIDIA-Nemotron-Nano-9B-v2")
     ap.add_argument("-o", "--output", type=Path, required=True)
+    ap.add_argument("--function-head-out", type=Path, default=None,
+                    help="side gguf for the turn-taking head; default <output>-function-head.gguf")
+    ap.add_argument("--no-function-head", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -366,9 +379,10 @@ def main() -> None:
     # which is token 12. Writing the base ids would make llama.cpp stop on the
     # model's pad, i.e. on the first silent frame.
     overrides = {}
+    stt_cfg = {}
     try:
-        model_cfg = json.loads(src.kv["voicechat.config.model"])
-        overrides = model_cfg["stt"]["model"]["override_tokens"]
+        stt_cfg = json.loads(src.kv["voicechat.config.model"])["stt"]["model"]
+        overrides = stt_cfg["override_tokens"]
     except (KeyError, ValueError):
         logger.warning("no stt.model.override_tokens in the source, using the reference ids")
 
@@ -484,7 +498,7 @@ def main() -> None:
     dropped = [n for n in src.tensors if not (n.startswith(SRC_LLM)
                                               or n in ("stt_model.embed_tokens.weight",
                                                        "stt_model.lm_head.weight"))]
-    logger.info("dropped %d tensors (perception / rnnt / function head / tts / codec)", len(dropped))
+    logger.info("dropped %d tensors (perception / rnnt / tts / codec)", len(dropped))
 
     # ---------------------------------------------------------------- write
 
@@ -497,6 +511,52 @@ def main() -> None:
 
     size = os.path.getsize(args.output)
     logger.info("wrote %s (%.3f GiB)", args.output, size / 1024 ** 3)
+
+    # ---------------------------------------------------------- function head
+
+    if args.no_function_head:
+        return
+
+    fh_path = args.function_head_out
+    if fh_path is None:
+        fh_path = args.output.with_name(args.output.stem + "-function-head.gguf")
+
+    t = take("stt_model.function_head.weight")
+    by_text = {tk: i for i, tk in enumerate(voc["tokens"])}
+
+    fw = gguf.GGUFWriter(path=None, arch="voicechat_function_head")
+    fw.add_type(gguf.GGUFType.MODEL)
+    fw.add_name("NemotronLabs VoiceChat 11B function head")
+    fw.add_description(
+        "Turn-taking / tool-call output head for llama-voicechat. Shares the STT LLM's "
+        "vocabulary and hidden state; its output token is part of the next frame's input sum."
+    )
+
+    # weights of the per-frame input sum, from the NeMo AddFusion module
+    fw.add_float32("voicechat.fusion.text_weight", float(stt_cfg.get("duplex_text_channel_weight", 1.0)))
+    fw.add_float32("voicechat.fusion.audio_weight", float(stt_cfg.get("duplex_user_channel_weight", 1.0)))
+    fw.add_float32("voicechat.fusion.function_weight", float(stt_cfg.get("duplex_function_channel_weight", 1.0)))
+
+    # the event tokens the channel carries; nemo speechlm2 DuplexSTTModel hardcodes these names
+    for key, tok in (("sotc", "<SPECIAL_20>"), ("eotc", "<SPECIAL_21>"), ("eotr", "<SPECIAL_22>")):
+        if tok not in by_text:
+            raise SystemExit(f"{tok} is not in the tokenizer")
+        fw.add_uint32(f"voicechat.function.{key}_token_id", by_text[tok])
+
+    block, bsize = GGML_BLOCK[t["ty"]]
+    row_elems = t["dims"][0]
+    data = np.frombuffer(src.raw(t), dtype=np.uint8).reshape(
+        t["elements"] // row_elems, row_elems // block * bsize)
+    fw.add_tensor("function_head.weight", data, raw_shape=data.shape,
+                  raw_dtype=getattr(gguf.GGMLQuantizationType, t["ty"]))
+
+    fw.open_output_file(fh_path)
+    fw.write_header_to_file()
+    fw.write_kv_data_to_file()
+    fw.write_tensors_to_file(progress=True)
+    fw.close()
+
+    logger.info("wrote %s (%.1f MiB)", fh_path, os.path.getsize(fh_path) / 1024 ** 2)
 
 
 if __name__ == "__main__":
