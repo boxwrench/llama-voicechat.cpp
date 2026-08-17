@@ -1,0 +1,119 @@
+name: Release VoiceChat (CUDA, windows)
+
+# The only workflow this fork runs. Every upstream llama.cpp workflow is disabled
+# here - they build a matrix this fork has no runners for. Trigger this by hand
+# from the Actions tab when a release needs its CUDA binaries.
+#
+# The CPU zip is built and attached by hand, so this workflow only makes the two
+# CUDA assets:
+#   llama-voicechat-bin-win-cuda-12.8-x64.zip   self-contained, exe + all dlls
+#   cudart-llama-bin-win-cuda-12.8-x64.zip      the CUDA runtime dlls
+#
+# 12.8 is the lowest toolkit that can build sm_120 (Blackwell, RTX 50xx).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the assets to (empty = artifacts only)'
+        required: false
+        type: string
+        default: 'v1.0.0'
+
+env:
+  CUDA_VERSION: '12.8'
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ env.CUDA_VERSION }}
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: voicechat-release-windows-2022-x64-cuda-${{ env.CUDA_VERSION }}
+
+      # Self-contained build: GGML_BACKEND_DL stays off so the zip runs on its own,
+      # the same layout as the hand-built CPU zip. AVX2 is the CPU baseline, which
+      # matches what the CPU zip was compiled with.
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLAMA_CURL=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=OFF ^
+            -DGGML_AVX=ON ^
+            -DGGML_AVX2=ON ^
+            -DGGML_FMA=ON ^
+            -DGGML_F16C=ON ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-voicechat llama-cli
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: voicechat-release-windows-2022-x64-cuda-${{ env.CUDA_VERSION }}
+
+      - name: Check llama-voicechat starts
+        run: |
+          .\build\bin\Release\llama-voicechat.exe --help | Select-Object -First 5
+
+      - name: Pack binaries
+        run: |
+          7z a -snl llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip .\build\bin\Release\*
+
+      - name: Pack Cuda runtime
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{ env.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          # robocopy exits non-zero on success, so do not let that fail the step
+          if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 }
+          7z a cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip $dst\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64
+          path: |
+            llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip
+            cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip
+
+      - name: Attach to release
+        if: ${{ inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" `
+            llama-voicechat-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip `
+            cudart-llama-bin-win-cuda-${{ env.CUDA_VERSION }}-x64.zip `
+            --clobber
