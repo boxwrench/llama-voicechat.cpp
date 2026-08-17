@@ -221,9 +221,13 @@ llama-voicechat -m nemotron_voicechat_11b-stt-llm-Q4_0.gguf --mmproj mmproj-voic
 
 That writes 559 tensors, 685 MiB, with the hyper-parameters as real KV, plus a
 baked character table for the subword encoder (which is why it needs --ref-dir).
-The graph that consumes it lives in `voicechat-tts.cpp` and runs on the CPU
-through plain ggml graphs: the text channel token of every frame drives one
-backbone step, and the wav is decoded at the end of the run. The specification
+The graph that consumes it lives in `voicechat-tts.cpp`, on plain ggml graphs
+driven through a `ggml_backend_sched`: the text channel token of every frame
+drives one backbone step, and the wav is decoded at the end of the run. The
+device is `--tts-device` (or `VC_TTS_DEVICE`), defaulting to whatever `--device`
+put the llm on and then to the first GPU there is. The scheduler carries a CPU
+backend behind the chosen one, so any op the device does not implement falls
+back instead of aborting the turn. The specification
 below was read off `speech_generation.model` in the source config, confirmed
 against every tensor shape, and settled against the NeMo `speechlm2` source
 (branch `nemotron-labs-voicechat` of NVIDIA-NeMo/Speech, mirrored locally in
@@ -327,8 +331,15 @@ Deviation from the reference: frame 0, which NeMo leaves as zero codes because
 its loop starts at t=1, is emitted as the codec silence frame here.
 
 The codec decoder runs in short causal chunks with discarded overlap so the
-plain ggml scratch stays bounded, and the 16 point ISTFT (periodic hann, hop 4,
+compute buffer stays bounded, and the 16 point ISTFT (periodic hann, hop 4,
 envelope normalized, value range constrained) is done on the CPU.
+
+Three other things stay on the CPU whatever `--tts-device` says, and they are
+what a turn now spends most of its time on: the 31 stage residual RVQ search
+(1024 candidates per stage, per frame), the nucleus filter and gumbel pick over
+the 1024 mixture components, and the low rank mixture mean. They read weight
+rows straight out of the gguf, which is why the host copy of the weights is
+kept alongside the device mirror.
 
 ### Debugging
 

@@ -29,6 +29,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "mtmd.h"
@@ -331,6 +332,7 @@ struct vc_session {
 
     // how the tts is (re)built on reset
     std::string tts_path;
+    std::string tts_device;                  // ggml backend name, empty = auto
     int         tts_threads   = 4;
     uint32_t    tts_seed      = 42;
 
@@ -398,7 +400,7 @@ struct vc_session {
     // answer", and the model carries on without one.
     std::function<std::string(const std::string &)> on_tool_call;
 
-    bool init(common_params & params, const std::string & tts_gguf);
+    bool init(common_params & params, const std::string & tts_gguf, const std::string & tts_dev);
     bool init_tts();
     void teardown();
     void reset();
@@ -409,7 +411,7 @@ struct vc_session {
     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
 };
 
-bool vc_session::init(common_params & params, const std::string & tts_gguf) {
+bool vc_session::init(common_params & params, const std::string & tts_gguf, const std::string & tts_dev) {
     llama_init = common_init_from_params(params);
     model = llama_init->model();
     lctx  = llama_init->context();
@@ -486,6 +488,12 @@ bool vc_session::init(common_params & params, const std::string & tts_gguf) {
     srow.resize(n_embd);
 
     tts_path    = tts_gguf;
+    tts_device  = tts_dev;
+    // no --tts-device: sit on the same card the llm was pinned to, so a box with
+    // two GPUs does not silently split the model across both
+    if (tts_device.empty() && !params.devices.empty() && params.devices[0]) {
+        tts_device = ggml_backend_dev_name(params.devices[0]);
+    }
     tts_threads = params.cpuparams.n_threads;
     tts_seed    = params.sampling.seed == LLAMA_DEFAULT_SEED ? 42 : (uint32_t) params.sampling.seed;
     if (!tts_path.empty() && !init_tts()) {
@@ -504,7 +512,7 @@ bool vc_session::init_tts() {
     // most of its speech in the drain, so give the cache a full second
     // timeline's worth of headroom; tts_cap is what stops it going over.
     tts_cap = 2 * n_frames_max + n_drain_max;
-    tts = voicechat_tts_init(tts_path.c_str(), tts_threads, tts_cap, tts_seed);
+    tts = voicechat_tts_init(tts_path.c_str(), tts_device.c_str(), tts_threads, tts_cap, tts_seed);
     return tts != nullptr;
 }
 
@@ -1221,7 +1229,7 @@ static void show_usage(int /*argc*/, char ** argv) {
     LOG("\nSpeech in, text and speech out, for the NemotronLabs VoiceChat GGUF.\n\n"
         "Usage: %s -m <stt-llm.gguf> --mmproj <perception.gguf> --audio <file.wav>\n"
         "          [--system <text>] [--system-file <file>]\n"
-        "          [--tts <voicechat-tts.gguf>] [--tts-out <out.wav>]\n"
+        "          [--tts <voicechat-tts.gguf>] [--tts-out <out.wav>] [--tts-device <dev>]\n"
         "          [--extra-decoding-seconds <s>] [--session-seconds <s>]\n"
         "          [--tool-response <text>]\n"
         "   or: %s -m ... --mmproj ... --serve   (json lines on stdin/stdout)\n"
@@ -1235,6 +1243,8 @@ static void show_usage(int /*argc*/, char ** argv) {
         "  with --tts the text channel also drives the speech generator and the\n"
         "  agent's voice is written to --tts-out (default voicechat-out.wav); with\n"
         "  several turns the file name gets a -2, -3 ... suffix.\n"
+        "  --tts-device names the ggml backend the speech generator runs on, e.g.\n"
+        "  CUDA0 or CPU; the default follows --device, then the first GPU there is.\n"
         "  --say reads a sentence out in the agent's voice instead of running the\n"
         "  llm at all, which is how you make an English test clip without a mic.\n"
         "  --serve keeps the process and the conversation alive and speaks json:\n"
@@ -1303,6 +1313,7 @@ int main(int argc, char ** argv) {
 
     // our own flags, taken out of argv before common_params_parse sees them
     std::string tts_path;
+    std::string tts_device;
     std::string tts_out = "voicechat-out.wav";
     std::string sys_prompt;
     std::string tool_response;
@@ -1317,6 +1328,8 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < argc; ++i) {
             if (strcmp(argv[i], "--tts") == 0 && i + 1 < argc) {
                 tts_path = argv[++i];
+            } else if (strcmp(argv[i], "--tts-device") == 0 && i + 1 < argc) {
+                tts_device = argv[++i];
             } else if (strcmp(argv[i], "--tts-out") == 0 && i + 1 < argc) {
                 tts_out = argv[++i];
             } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
@@ -1375,7 +1388,7 @@ int main(int argc, char ** argv) {
     sess.n_extra_max   = std::max(1, (int) (extra_seconds * 12.5f));
     sess.n_frames_max  = std::max(64, (int) (session_seconds * 12.5f));
 
-    if (!sess.init(params, tts_path)) {
+    if (!sess.init(params, tts_path, tts_device)) {
         return 1;
     }
 

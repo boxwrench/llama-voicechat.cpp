@@ -10,8 +10,12 @@
 
 struct voicechat_tts;
 
-// n_frames_max sizes the backbone kv cache; seed drives the MoG sampling
-voicechat_tts * voicechat_tts_init(const char * fname, int n_threads, int n_frames_max, uint32_t seed);
+// `device` names the ggml backend the graphs run on ("CUDA0", "CPU", ...);
+// nullptr or "" takes the first GPU the registry reports and falls back to the
+// cpu, and VC_TTS_DEVICE overrides it. n_frames_max sizes the backbone kv
+// cache; n_threads only matters on the cpu; seed drives the MoG sampling.
+voicechat_tts * voicechat_tts_init(const char * fname, const char * device,
+                                   int n_threads, int n_frames_max, uint32_t seed);
 
 // one 80 ms frame; text_token is this frame's token on the STT text channel
 void voicechat_tts_step(voicechat_tts * tts, int32_t text_token);

@@ -20,6 +20,7 @@
 #include "voicechat-tts.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "log.h"
@@ -90,47 +91,84 @@ static float softplus(float x) {
 
 // --------------------------------------------------------------- graph runner
 
-// one reusable scratch arena; a graph is built, run and thrown away per call.
-// cache writes are expanded into the graph as they are built, so they always
-// execute before the attention nodes that read the cache.
+// A graph is built into a metadata-only context, allocated by a gallocr, fed,
+// run on the backend and thrown away per call. Cache writes are expanded into
+// the graph as they are built, so they always execute before the attention
+// nodes that read the cache.
+//
+// Two rules come with the allocator that did not apply to the old cpu arena:
+// inputs are uploaded after the graph is allocated, not written at build time,
+// and anything read back afterwards must be listed in compute() - every other
+// intermediate is fair game for reuse.
+//
+// The graphs go through a ggml_backend_sched over [device, cpu] rather than
+// straight at one backend. Four different graph shapes run here and the codec
+// half of them reaches for ops (transposed conv, exact gelu, concat) that not
+// every backend implements; the scheduler puts whatever the device cannot do
+// back on the cpu instead of aborting mid-turn.
 struct vc_sched {
-    std::vector<uint8_t> buf;
-    std::vector<uint8_t> work;
+    ggml_backend_t backend  = nullptr;   // where the weights live
+    ggml_backend_t back_cpu = nullptr;   // fallback, null when backend is the cpu
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<uint8_t> meta;           // graph + tensor structs only, no data
     ggml_context * ctx = nullptr;
     ggml_cgraph  * gf  = nullptr;
-    int n_threads = 4;
+
+    struct upload {
+        ggml_tensor * t;
+        const void  * src;
+    };
+    std::vector<upload> pending;
 
     ggml_context * begin() {
-        ggml_init_params ip = { buf.size(), buf.data(), false };
+        ggml_backend_sched_reset(sched);
+        ggml_init_params ip = { meta.size(), meta.data(), /*.no_alloc =*/ true };
         ctx = ggml_init(ip);
         gf  = ggml_new_graph_custom(ctx, VC_MAX_NODES, false);
+        pending.clear();
         return ctx;
     }
 
-    void compute(std::initializer_list<ggml_tensor *> outs) {
+    // `data` has to stay put until compute() copies it in
+    ggml_tensor * input(int64_t ne0, int64_t ne1, const void * data, ggml_type type = GGML_TYPE_F32) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+        ggml_set_input(t);
+        pending.push_back({ t, data });
+        return t;
+    }
+
+    bool compute(std::initializer_list<ggml_tensor *> outs) {
         for (ggml_tensor * t : outs) {
+            ggml_set_output(t);          // before the alloc, or it gets reused
             ggml_build_forward_expand(gf, t);
         }
-        ggml_cplan plan = ggml_graph_plan(gf, n_threads, nullptr);
-        if (plan.work_size > 0) {
-            work.resize(plan.work_size);
-            plan.work_data = work.data();
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LOG_ERR("voicechat-tts: graph allocation failed\n");
+            return false;
         }
-        ggml_graph_compute(gf, &plan);
+        for (const upload & u : pending) {
+            ggml_backend_tensor_set(u.t, u.src, 0, ggml_nbytes(u.t));
+        }
+        return ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+    }
+
+    void get(const ggml_tensor * t, void * dst, size_t off = 0, size_t n = 0) const {
+        ggml_backend_tensor_get(t, dst, off, n ? n : ggml_nbytes(t));
     }
 
     void end() {
         ggml_free(ctx);
         ctx = nullptr;
         gf  = nullptr;
+        pending.clear();
+    }
+
+    void free_all() {
+        if (sched)    { ggml_backend_sched_free(sched); sched = nullptr; }
+        if (back_cpu) { ggml_backend_free(back_cpu); back_cpu = nullptr; }
+        if (backend)  { ggml_backend_free(backend); backend = nullptr; }
     }
 };
-
-static ggml_tensor * new_input(ggml_context * ctx, int64_t ne0, int64_t ne1, const float * data) {
-    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
-    memcpy(t->data, data, ggml_nbytes(t));
-    return t;
-}
 
 // rms norm with a gemma-style weight (the converter already folded the +1 in)
 static ggml_tensor * rms(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, float eps) {
@@ -164,10 +202,17 @@ struct vc_dec_block {
 
 struct voicechat_tts {
     gguf_context * gctx  = nullptr;
-    ggml_context * ctx_w = nullptr;   // weights
+    ggml_context * ctx_w = nullptr;   // weights, host side (dq_row / matvec read these)
+    ggml_context * ctx_g = nullptr;   // the same weights, in backend memory
+    bool dev_is_cpu = false;
     ggml_context * ctx_c = nullptr;   // kv cache
-    std::vector<uint8_t> cache_buf;
+    ggml_backend_buffer_t buf_w = nullptr;
+    ggml_backend_buffer_t buf_c = nullptr;
     vc_sched sched;
+    std::vector<float> zeros;         // causal left pad fed to the codec graphs
+
+    // graphs always read the mirror, never the raw gguf tensors
+    ggml_context * wctx() const { return ctx_g; }
 
     // hparams
     int n_layer, n_embd, n_head, head_dim;
@@ -228,7 +273,9 @@ struct voicechat_tts {
     std::mt19937 rng;
     std::vector<float> vbuf;
 
-    bool load(const char * fname, int n_threads, int n_frames_max, uint32_t seed);
+    bool load(const char * fname, const char * device, int n_threads, int n_frames_max, uint32_t seed);
+    bool init_backend(const char * device, int n_threads);
+    bool mirror_weights();
     bool warmup();
     void frame_cond(int32_t tok, float * out);
     void backbone_step(const float * code_emb, const float * cond,
@@ -256,8 +303,7 @@ ggml_tensor * voicechat_tts::build_gemma_block(ggml_context * ctx, const vc_tts_
                                                ggml_tensor * ck, ggml_tensor * cv, int p0, int n_tok) {
     const int nh = n_head, hd = head_dim;
 
-    ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok_total);
-    memcpy(pos_t->data, pos_ids, n_tok_total * sizeof(int32_t));
+    ggml_tensor * pos_t = sched.input(n_tok_total, 1, pos_ids, GGML_TYPE_I32);
 
     ggml_tensor * cur = rms(ctx, x, L.attn_norm, eps);
 
@@ -335,13 +381,182 @@ ggml_tensor * voicechat_tts::build_gemma_block(ggml_context * ctx, const vc_tts_
     return ggml_add(ctx, x, f);
 }
 
+// ------------------------------------------------------------------- backend
+//
+// The graphs run on one device. Which one is picked by name (VC_TTS_DEVICE, or
+// whatever the caller passes), otherwise the first GPU the registry reports,
+// otherwise the cpu. The speech generator is small next to the llm - the point
+// of naming a device is being able to park it on the second card when the
+// first one is full.
+
+bool voicechat_tts::init_backend(const char * device, int n_threads) {
+    if (const char * env = getenv("VC_TTS_DEVICE")) {
+        device = env;
+    }
+
+    ggml_backend_dev_t dev = nullptr;
+
+    if (device && *device) {
+        dev = ggml_backend_dev_by_name(device);
+        if (!dev) {
+            LOG_ERR("voicechat-tts: no backend device named %s\n", device);
+            return false;
+        }
+    } else {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (!dev) {
+        LOG_ERR("voicechat-tts: no usable backend\n");
+        return false;
+    }
+
+    sched.backend = ggml_backend_dev_init(dev, nullptr);
+    if (!sched.backend) {
+        LOG_ERR("voicechat-tts: cannot init backend %s\n", ggml_backend_dev_name(dev));
+        return false;
+    }
+
+    const bool is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+    if (is_cpu && n_threads > 0) {
+        auto set_n_threads = (ggml_backend_set_n_threads_t)
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_n_threads");
+        if (set_n_threads) {
+            set_n_threads(sched.backend, n_threads);
+        }
+    }
+
+    // metadata only: the graph struct and the tensor structs, never any data
+    sched.meta.resize(VC_MAX_NODES * ggml_tensor_overhead()
+                      + ggml_graph_overhead_custom(VC_MAX_NODES, false) + (1u << 20));
+
+    // the cpu goes in as the last backend so the scheduler has somewhere to put
+    // an op the device does not implement
+    ggml_backend_t backends[2] = { sched.backend, nullptr };
+    int n_backends = 1;
+    if (!is_cpu) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            sched.back_cpu = ggml_backend_dev_init(cpu_dev, nullptr);
+            if (sched.back_cpu) {
+                if (n_threads > 0) {
+                    auto set_n_threads = (ggml_backend_set_n_threads_t)
+                        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_set_n_threads");
+                    if (set_n_threads) {
+                        set_n_threads(sched.back_cpu, n_threads);
+                    }
+                }
+                backends[n_backends++] = sched.back_cpu;
+            }
+        }
+    }
+
+    sched.sched = ggml_backend_sched_new(backends, nullptr, n_backends, VC_MAX_NODES, false, true);
+    if (!sched.sched) {
+        LOG_ERR("voicechat-tts: cannot create the graph scheduler\n");
+        return false;
+    }
+
+    size_t dev_free = 0, dev_total = 0;
+    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    LOG_INF("voicechat-tts: device %s (%s), %.0f MiB free of %.0f MiB\n",
+            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+            dev_free / 1048576.0, dev_total / 1048576.0);
+
+    // Always, cpu included: ggml_backend_sched resolves a leaf's backend from
+    // the buffer it sits in, and a bare gguf tensor has none. On the cpu the
+    // mirror is host memory anyway, so nothing is copied across a bus - it just
+    // costs a second copy of the weights in RAM, which the 1.5 GiB scratch
+    // arena this replaced more than paid for.
+    dev_is_cpu = is_cpu;
+    return mirror_weights();
+}
+
+// Copy every weight into device memory. The host copy stays: the RVQ search,
+// the MoG mixture pick and the subword embedding lookup are scalar cpu code
+// that reads tensor rows directly, and those keep reading ctx_w.
+bool voicechat_tts::mirror_weights() {
+    // gguf_init_from_file with no_alloc=false puts one I8 blob tensor in the
+    // context and points every real tensor into it. Mirroring that blob would
+    // double the buffer, so only what the file actually lists gets copied.
+    auto is_weight = [this](const ggml_tensor * t) {
+        return gguf_find_tensor(gctx, ggml_get_name(t)) >= 0;
+    };
+
+    int n_tensor = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_w); t; t = ggml_get_next_tensor(ctx_w, t)) {
+        n_tensor += is_weight(t) ? 1 : 0;
+    }
+
+    ggml_init_params ip = { (size_t) (n_tensor + 16) * ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
+    ctx_g = ggml_init(ip);
+    if (!ctx_g) {
+        return false;
+    }
+
+    // The codec upsamplers are stored f16 and CUDA only takes f32 on both sides
+    // of a transposed conv, so on a device those land converted. On the cpu they
+    // stay f16: that path already works and converting would move the arithmetic
+    // and change the samples.
+    const bool cpu = dev_is_cpu;
+    auto is_dec_up = [cpu](const char * name) {
+        return !cpu && strncmp(name, "codec.dec.up.", 13) == 0;
+    };
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_w); t; t = ggml_get_next_tensor(ctx_w, t)) {
+        if (!is_weight(t)) {
+            continue;
+        }
+        ggml_tensor * d = is_dec_up(ggml_get_name(t))
+            ? ggml_new_tensor(ctx_g, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne)
+            : ggml_dup_tensor(ctx_g, t);
+        ggml_set_name(d, ggml_get_name(t));
+    }
+
+    buf_w = ggml_backend_alloc_ctx_tensors(ctx_g, sched.backend);
+    if (!buf_w) {
+        LOG_ERR("voicechat-tts: cannot allocate %d weight tensors on the device\n", n_tensor);
+        return false;
+    }
+
+    std::vector<float> conv;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_w); t; t = ggml_get_next_tensor(ctx_w, t)) {
+        if (!is_weight(t)) {
+            continue;
+        }
+        ggml_tensor * d = ggml_get_tensor(ctx_g, ggml_get_name(t));
+        if (!d) {
+            return false;
+        }
+        if (d->type == t->type) {
+            ggml_backend_tensor_set(d, t->data, 0, ggml_nbytes(t));
+        } else {
+            const int64_t n = ggml_nelements(t);
+            conv.resize((size_t) n);
+            ggml_get_type_traits(t->type)->to_float(t->data, conv.data(), n);
+            ggml_backend_tensor_set(d, conv.data(), 0, (size_t) n * sizeof(float));
+        }
+    }
+
+    LOG_INF("voicechat-tts: %d weight tensors, %.0f MiB on the device\n",
+            n_tensor, ggml_backend_buffer_get_size(buf_w) / 1048576.0);
+    return true;
+}
+
 // ---------------------------------------------------------------------- load
 
-bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, uint32_t seed) {
+bool voicechat_tts::load(const char * fname, const char * device, int n_threads, int n_frames_max, uint32_t seed) {
     gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_w };
     gctx = gguf_init_from_file(fname, gp);
     if (!gctx) {
         LOG_ERR("voicechat-tts: cannot load %s\n", fname);
+        return false;
+    }
+
+    if (!init_backend(device, n_threads)) {
         return false;
     }
 
@@ -393,35 +608,41 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
     }
 
     // ---- tensors
+    //
+    // ctx_d is the device mirror, ctx_w the host copy. Everything a graph
+    // reads comes from ctx_d; the handful of weights the scalar cpu code walks
+    // row by row (the subword embedding, the code embedding, the MoG mixture
+    // matrices) stay on ctx_w.
+    ggml_context * ctx_d = wctx();
 
     layers.resize(n_layer);
     for (int i = 0; i < n_layer; ++i) {
         auto & L = layers[i];
         const std::string b = "blk." + std::to_string(i) + ".";
-        L.wq             = get_weight(ctx_w, b + "attn_q.weight");
-        L.wk             = get_weight(ctx_w, b + "attn_k.weight");
-        L.wv             = get_weight(ctx_w, b + "attn_v.weight");
-        L.wo             = get_weight(ctx_w, b + "attn_output.weight");
-        L.q_norm         = get_weight(ctx_w, b + "attn_q_norm.weight");
-        L.k_norm         = get_weight(ctx_w, b + "attn_k_norm.weight");
-        L.attn_norm      = get_weight(ctx_w, b + "attn_norm.weight");
-        L.post_attn_norm = get_weight(ctx_w, b + "post_attention_norm.weight");
-        L.ffn_norm       = get_weight(ctx_w, b + "ffn_norm.weight");
-        L.post_ffn_norm  = get_weight(ctx_w, b + "post_ffw_norm.weight");
-        L.gate           = get_weight(ctx_w, b + "ffn_gate.weight");
-        L.up             = get_weight(ctx_w, b + "ffn_up.weight");
-        L.down           = get_weight(ctx_w, b + "ffn_down.weight");
+        L.wq             = get_weight(ctx_d, b + "attn_q.weight");
+        L.wk             = get_weight(ctx_d, b + "attn_k.weight");
+        L.wv             = get_weight(ctx_d, b + "attn_v.weight");
+        L.wo             = get_weight(ctx_d, b + "attn_output.weight");
+        L.q_norm         = get_weight(ctx_d, b + "attn_q_norm.weight");
+        L.k_norm         = get_weight(ctx_d, b + "attn_k_norm.weight");
+        L.attn_norm      = get_weight(ctx_d, b + "attn_norm.weight");
+        L.post_attn_norm = get_weight(ctx_d, b + "post_attention_norm.weight");
+        L.ffn_norm       = get_weight(ctx_d, b + "ffn_norm.weight");
+        L.post_ffn_norm  = get_weight(ctx_d, b + "post_ffw_norm.weight");
+        L.gate           = get_weight(ctx_d, b + "ffn_gate.weight");
+        L.up             = get_weight(ctx_d, b + "ffn_up.weight");
+        L.down           = get_weight(ctx_d, b + "ffn_down.weight");
         if (!L.wq || !L.down) { return false; }
     }
-    output_norm = get_weight(ctx_w, "output_norm.weight");
+    output_norm = get_weight(ctx_d, "output_norm.weight");
 
     embed_code_w = get_weight(ctx_w, "tts.embed_code.weight");
     low_mat      = get_weight(ctx_w, "tts.mog.low_mat");
     proj_mus     = get_weight(ctx_w, "tts.mog.mus.weight");
-    mog_logits_w = get_weight(ctx_w, "tts.mog.logits.weight");
-    mog_logs_w   = get_weight(ctx_w, "tts.mog.logs.weight");
-    mog_else_w   = get_weight(ctx_w, "tts.mog.else.weight");
-    mog_norm     = get_weight(ctx_w, "tts.mog.norm.weight");
+    mog_logits_w = get_weight(ctx_d, "tts.mog.logits.weight");
+    mog_logs_w   = get_weight(ctx_d, "tts.mog.logs.weight");
+    mog_else_w   = get_weight(ctx_d, "tts.mog.else.weight");
+    mog_norm     = get_weight(ctx_d, "tts.mog.norm.weight");
     if (!embed_code_w || !low_mat || !proj_mus || !mog_logits_w || !mog_logs_w || !mog_else_w || !mog_norm) {
         return false;
     }
@@ -432,18 +653,18 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
     mog_blk.resize(mog_layers);
     for (int i = 0; i < mog_layers; ++i) {
         const std::string b = "tts.mog.blk." + std::to_string(i) + ".";
-        mog_blk[i].pre_norm  = get_weight(ctx_w, b + "pre_norm.weight");
-        mog_blk[i].post_norm = get_weight(ctx_w, b + "post_norm.weight");
-        mog_blk[i].gate      = get_weight(ctx_w, b + "ffn_gate.weight");
-        mog_blk[i].up        = get_weight(ctx_w, b + "ffn_up.weight");
-        mog_blk[i].down      = get_weight(ctx_w, b + "ffn_down.weight");
+        mog_blk[i].pre_norm  = get_weight(ctx_d, b + "pre_norm.weight");
+        mog_blk[i].post_norm = get_weight(ctx_d, b + "post_norm.weight");
+        mog_blk[i].gate      = get_weight(ctx_d, b + "ffn_gate.weight");
+        mog_blk[i].up        = get_weight(ctx_d, b + "ffn_up.weight");
+        mog_blk[i].down      = get_weight(ctx_d, b + "ffn_down.weight");
     }
 
-    fu_audio_w = get_weight(ctx_w, "tts.fusion.audio_proj.weight");
-    fu_audio_b = get_weight(ctx_w, "tts.fusion.audio_proj.bias");
-    fu_text_w  = get_weight(ctx_w, "tts.fusion.text_proj.weight");
-    fu_text_b  = get_weight(ctx_w, "tts.fusion.text_proj.bias");
-    fu_norm    = get_weight(ctx_w, "tts.fusion.norm.weight");
+    fu_audio_w = get_weight(ctx_d, "tts.fusion.audio_proj.weight");
+    fu_audio_b = get_weight(ctx_d, "tts.fusion.audio_proj.bias");
+    fu_text_w  = get_weight(ctx_d, "tts.fusion.text_proj.weight");
+    fu_text_b  = get_weight(ctx_d, "tts.fusion.text_proj.bias");
+    fu_norm    = get_weight(ctx_d, "tts.fusion.norm.weight");
     {
         ggml_tensor * g = get_weight(ctx_w, "tts.fusion.gate");
         ggml_tensor * r = get_weight(ctx_w, "tts.fusion.residual_scale");
@@ -461,22 +682,22 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
     // subword encoder
     {
         const std::string b = "tts.subword.blk.0.";
-        cas.wq             = get_weight(ctx_w, b + "attn_q.weight");
-        cas.wk             = get_weight(ctx_w, b + "attn_k.weight");
-        cas.wv             = get_weight(ctx_w, b + "attn_v.weight");
-        cas.wo             = get_weight(ctx_w, b + "attn_output.weight");
+        cas.wq             = get_weight(ctx_d, b + "attn_q.weight");
+        cas.wk             = get_weight(ctx_d, b + "attn_k.weight");
+        cas.wv             = get_weight(ctx_d, b + "attn_v.weight");
+        cas.wo             = get_weight(ctx_d, b + "attn_output.weight");
         cas.q_norm         = nullptr;
         cas.k_norm         = nullptr;
-        cas.attn_norm      = get_weight(ctx_w, b + "attn_norm.weight");
-        cas.post_attn_norm = get_weight(ctx_w, b + "post_attention_norm.weight");
-        cas.ffn_norm       = get_weight(ctx_w, b + "ffn_norm.weight");
-        cas.post_ffn_norm  = get_weight(ctx_w, b + "post_ffw_norm.weight");
-        cas.gate           = get_weight(ctx_w, b + "ffn_gate.weight");
-        cas.up             = get_weight(ctx_w, b + "ffn_up.weight");
-        cas.down           = get_weight(ctx_w, b + "ffn_down.weight");
+        cas.attn_norm      = get_weight(ctx_d, b + "attn_norm.weight");
+        cas.post_attn_norm = get_weight(ctx_d, b + "post_attention_norm.weight");
+        cas.ffn_norm       = get_weight(ctx_d, b + "ffn_norm.weight");
+        cas.post_ffn_norm  = get_weight(ctx_d, b + "post_ffw_norm.weight");
+        cas.gate           = get_weight(ctx_d, b + "ffn_gate.weight");
+        cas.up             = get_weight(ctx_d, b + "ffn_up.weight");
+        cas.down           = get_weight(ctx_d, b + "ffn_down.weight");
         cas_embed          = get_weight(ctx_w, "tts.subword.embed_tokens.weight");
         cas_proj           = get_weight(ctx_w, "tts.subword.proj.weight");
-        cas_out_norm       = get_weight(ctx_w, "tts.subword.output_norm.weight");
+        cas_out_norm       = get_weight(ctx_d, "tts.subword.output_norm.weight");
         if (!cas.wq || !cas.down || !cas_embed || !cas_proj || !cas_out_norm) { return false; }
 
         ggml_tensor * ce = get_weight(ctx_w, "tts.subword.cont_emb.weight");
@@ -537,21 +758,21 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
     {
         const int up_idx[3] = { 0, 4, 8 };
         for (int i = 0; i < 3; ++i) {
-            dec_up[i] = get_weight(ctx_w, "codec.dec.up." + std::to_string(up_idx[i]) + ".weight");
+            dec_up[i] = get_weight(ctx_d, "codec.dec.up." + std::to_string(up_idx[i]) + ".weight");
             if (!dec_up[i]) { return false; }
         }
-        dec_head = get_weight(ctx_w, "codec.dec.head.weight");
+        dec_head = get_weight(ctx_d, "codec.dec.head.weight");
         for (int i = 0; i < 9; ++i) {
             const std::string b = "codec.dec.blk." + std::to_string(i) + ".";
             auto & B = dec_blk[i];
-            B.dw_w   = get_weight(ctx_w, b + "dwconv.weight");
-            B.dw_b   = get_weight(ctx_w, b + "dwconv.bias");
-            B.norm_w = get_weight(ctx_w, b + "norm.weight");
-            B.norm_b = get_weight(ctx_w, b + "norm.bias");
-            B.pw1_w  = get_weight(ctx_w, b + "pw1.weight");
-            B.pw1_b  = get_weight(ctx_w, b + "pw1.bias");
-            B.pw2_w  = get_weight(ctx_w, b + "pw2.weight");
-            B.pw2_b  = get_weight(ctx_w, b + "pw2.bias");
+            B.dw_w   = get_weight(ctx_d, b + "dwconv.weight");
+            B.dw_b   = get_weight(ctx_d, b + "dwconv.bias");
+            B.norm_w = get_weight(ctx_d, b + "norm.weight");
+            B.norm_b = get_weight(ctx_d, b + "norm.bias");
+            B.pw1_w  = get_weight(ctx_d, b + "pw1.weight");
+            B.pw1_b  = get_weight(ctx_d, b + "pw1.bias");
+            B.pw2_w  = get_weight(ctx_d, b + "pw2.weight");
+            B.pw2_b  = get_weight(ctx_d, b + "pw2.bias");
             if (!B.dw_w || !B.pw2_b) { return false; }
         }
     }
@@ -560,9 +781,7 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
 
     n_ctx = n_prompt + n_frames_max + 4;
     {
-        const size_t one = (size_t) n_embd * 2 * n_ctx * sizeof(ggml_fp16_t);
-        cache_buf.resize((size_t) n_layer * 2 * (ggml_tensor_overhead() + one) + 4096);
-        ggml_init_params ip = { cache_buf.size(), cache_buf.data(), false };
+        ggml_init_params ip = { (size_t) (2 * n_layer + 8) * ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
         ctx_c = ggml_init(ip);
         cache_k.resize(n_layer);
         cache_v.resize(n_layer);
@@ -570,10 +789,21 @@ bool voicechat_tts::load(const char * fname, int n_threads, int n_frames_max, ui
             cache_k[i] = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F16, n_embd, 2 * n_ctx);
             cache_v[i] = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F16, n_embd, 2 * n_ctx);
         }
+        buf_c = ggml_backend_alloc_ctx_tensors(ctx_c, sched.backend);
+        if (!buf_c) {
+            LOG_ERR("voicechat-tts: cannot allocate the kv cache for %d frames\n", n_ctx);
+            return false;
+        }
+        // reads never go past the write head, but a cache full of nan is a
+        // miserable thing to debug
+        ggml_backend_buffer_clear(buf_c, 0);
+        LOG_INF("voicechat-tts: kv cache %d frames, %.0f MiB\n", n_ctx,
+                ggml_backend_buffer_get_size(buf_c) / 1048576.0);
     }
 
-    sched.n_threads = n_threads;
-    sched.buf.resize((size_t) 1536 * 1024 * 1024);
+    // the causal left pad the codec blocks prepend; sized once so the pointers
+    // handed to the graph stay valid while it is being built
+    zeros.assign(64 * 1024, 0.0f);
 
     // unmasking schedule: rate r = i/n, masked share (1 - r^e)^(1/e) of the
     // 31 stages, per-iteration deltas; the early iterations unmask nothing
@@ -635,7 +865,7 @@ void voicechat_tts::frame_cond(int32_t tok, float * out) {
         }
 
         ggml_context * ctx = sched.begin();
-        ggml_tensor * x = new_input(ctx, n_embd, nc, chars.data());
+        ggml_tensor * x = sched.input(n_embd, nc, chars.data());
         x = ggml_scale(ctx, x, sqrtf((float) n_embd));
         std::vector<int32_t> pp(nc);
         std::iota(pp.begin(), pp.end(), 0);
@@ -644,14 +874,16 @@ void voicechat_tts::frame_cond(int32_t tok, float * out) {
         x = rms(ctx, x, cas_out_norm, eps);
         sched.compute({ x });
 
+        std::vector<float> xh((size_t) nc * n_embd);
+        sched.get(x, xh.data());
+        sched.end();
+
         std::vector<float> mean(n_embd, 0.0f);
-        const float * xd = (const float *) x->data;
         for (int i = 0; i < nc; ++i) {
             for (int j = 0; j < n_embd; ++j) {
-                mean[j] += xd[(size_t) i * n_embd + j];
+                mean[j] += xh[(size_t) i * n_embd + j];
             }
         }
-        sched.end();
         for (int j = 0; j < n_embd; ++j) {
             mean[j] /= nc;
         }
@@ -676,10 +908,10 @@ void voicechat_tts::backbone_step(const float * code_emb, const float * cond,
     const int n = 2 * n_tok;
 
     ggml_context * ctx = sched.begin();
-    ggml_tensor * a_in = new_input(ctx, n_embd, n, code_emb);
-    ggml_tensor * t_in = new_input(ctx, n_embd, n, cond);
-    ggml_tensor * ga   = new_input(ctx, n_embd, 1, fu_gate_a.data());
-    ggml_tensor * gt   = new_input(ctx, n_embd, 1, fu_gate_t.data());
+    ggml_tensor * a_in = sched.input(n_embd, n, code_emb);
+    ggml_tensor * t_in = sched.input(n_embd, n, cond);
+    ggml_tensor * ga   = sched.input(n_embd, 1, fu_gate_a.data());
+    ggml_tensor * gt   = sched.input(n_embd, 1, fu_gate_t.data());
 
     // gated fusion: sigmoid(gate) picks audio vs text, residual scale, rms
     ggml_tensor * a = ggml_add(ctx, ggml_mul_mat(ctx, fu_audio_w, ggml_scale(ctx, a_in, 1.0f / n_quant)), fu_audio_b);
@@ -693,7 +925,7 @@ void voicechat_tts::backbone_step(const float * code_emb, const float * cond,
     // it never applies. Scaling here makes the residual stream 34x larger than
     // every block's output, which effectively bypasses the backbone.
 
-    ggml_tensor * mask_t = mask ? new_input(ctx, pos + n_tok, n_tok, mask) : nullptr;
+    ggml_tensor * mask_t = mask ? sched.input(pos + n_tok, n_tok, mask) : nullptr;
 
     std::vector<int32_t> pp(n);
     for (int i = 0; i < n_tok; ++i) {
@@ -710,9 +942,10 @@ void voicechat_tts::backbone_step(const float * code_emb, const float * cond,
     x = rms(ctx, x, output_norm, eps);
     sched.compute({ x });
 
-    const float * xd = (const float *) x->data;
-    memcpy(h_cond,   xd + (size_t) (n_tok - 1)     * n_embd, n_embd * sizeof(float));
-    memcpy(h_uncond, xd + (size_t) (2 * n_tok - 1) * n_embd, n_embd * sizeof(float));
+    // only the last position of each half is needed
+    const size_t row = (size_t) n_embd * sizeof(float);
+    sched.get(x, h_cond,   (size_t) (n_tok - 1)     * row, row);
+    sched.get(x, h_uncond, (size_t) (2 * n_tok - 1) * row, row);
     sched.end();
 
     pos += n_tok;
@@ -746,7 +979,7 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
         }
 
         ggml_context * ctx = sched.begin();
-        ggml_tensor * x = new_input(ctx, n_embd, 2, xin.data());
+        ggml_tensor * x = sched.input(n_embd, 2, xin.data());
         for (int i = 0; i < mog_layers; ++i) {
             ggml_tensor * y = rms(ctx, x, mog_blk[i].pre_norm, eps);
             y = gated_mlp(ctx, y, mog_blk[i].gate, mog_blk[i].up, mog_blk[i].down);
@@ -763,13 +996,19 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
         ggml_tensor * t_logits = ggml_mul_mat(ctx, mog_logits_w, xg);
         ggml_tensor * t_logs   = ggml_mul_mat(ctx, mog_logs_w, xg);
         ggml_tensor * t_else   = ggml_mul_mat(ctx, mog_else_w, xg);
-        sched.compute({ t_logits, t_logs, t_else });
+        // xg is read back too, so it has to be an output; the allocator would
+        // hand its memory to the three head matmuls otherwise
+        sched.compute({ t_logits, t_logs, t_else, xg });
 
-        std::vector<float> logits((const float *) t_logits->data, (const float *) t_logits->data + n_pred);
-        const float logs = std::max(((const float *) t_logs->data)[0], min_log_std);
-        std::vector<float> mu_res((const float *) t_else->data, (const float *) t_else->data + n_latent);
-        std::vector<float> xg_h((const float *) xg->data, (const float *) xg->data + n_embd);
+        std::vector<float> logits(n_pred), mu_res(n_latent), xg_h(n_embd);
+        float logs_raw = 0.0f;
+        sched.get(t_logits, logits.data());
+        sched.get(t_logs,  &logs_raw, 0, sizeof(float));
+        sched.get(t_else,   mu_res.data());
+        sched.get(xg,       xg_h.data());
         sched.end();
+
+        const float logs = std::max(logs_raw, min_log_std);
 
         // nucleus filter over the mixture, then gumbel-max
         std::vector<int> idx(n_pred);
@@ -924,9 +1163,10 @@ bool voicechat_tts::warmup() {
 
 // ------------------------------------------------------------------------ api
 
-voicechat_tts * voicechat_tts_init(const char * fname, int n_threads, int n_frames_max, uint32_t seed) {
+voicechat_tts * voicechat_tts_init(const char * fname, const char * device,
+                                   int n_threads, int n_frames_max, uint32_t seed) {
     voicechat_tts * tts = new voicechat_tts();
-    if (!tts->load(fname, n_threads, n_frames_max, seed) || !tts->warmup()) {
+    if (!tts->load(fname, device, n_threads, n_frames_max, seed) || !tts->warmup()) {
         voicechat_tts_free(tts);
         return nullptr;
     }
@@ -1011,8 +1251,7 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
         const int L0   = lead + len;
 
         ggml_context * ctx = tts->sched.begin();
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_lat, L0);
-        memcpy(x->data, lat.data() + (size_t) (start - lead) * n_lat, ggml_nbytes(x));
+        ggml_tensor * x = tts->sched.input(n_lat, L0, lat.data() + (size_t) (start - lead) * n_lat);
 
         int blk = 0;
         for (int s = 0; s < 3; ++s) {
@@ -1025,8 +1264,12 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
             for (int b = 0; b < 3; ++b, ++blk) {
                 const auto & B = tts->dec_blk[blk];
                 const int kk = (int) B.dw_w->ne[0];
-                ggml_tensor * zpad = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, kk - 1);
-                memset(zpad->data, 0, ggml_nbytes(zpad));
+                if ((size_t) C * (kk - 1) > tts->zeros.size()) {
+                    LOG_ERR("voicechat-tts: codec pad %d x %d exceeds the zero buffer\n", C, kk - 1);
+                    tts->sched.end();
+                    return spec;
+                }
+                ggml_tensor * zpad = tts->sched.input(C, kk - 1, tts->zeros.data());
                 ggml_tensor * xp = ggml_concat(ctx, zpad, x, 1);              // causal left pad
                 ggml_tensor * y = nullptr;
                 for (int j = 0; j < kk; ++j) {
@@ -1053,12 +1296,14 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
         x = ggml_mul_mat(ctx, head_w, x);                                     // [n_spec, L]
         tts->sched.compute({ x });
 
-        const float * xd = (const float *) x->data;
+        std::vector<float> xh((size_t) n_spec * L0 * up_total);
+        tts->sched.get(x, xh.data());
+        tts->sched.end();
+
         for (int l = 0; l < len * up_total; ++l) {
             memcpy(spec.data() + (size_t) (start * up_total + l) * n_spec,
-                   xd + (size_t) (lead * up_total + l) * n_spec, n_spec * sizeof(float));
+                   xh.data() + (size_t) (lead * up_total + l) * n_spec, n_spec * sizeof(float));
         }
-        tts->sched.end();
     }
     return spec;
 }
@@ -1187,8 +1432,13 @@ void voicechat_tts_free(voicechat_tts * tts) {
     if (!tts) {
         return;
     }
+    tts->sched.end();
+    if (tts->buf_c) { ggml_backend_buffer_free(tts->buf_c); }
+    if (tts->buf_w) { ggml_backend_buffer_free(tts->buf_w); }
     if (tts->ctx_c) { ggml_free(tts->ctx_c); }
+    if (tts->ctx_g) { ggml_free(tts->ctx_g); }
     if (tts->ctx_w) { ggml_free(tts->ctx_w); }
     if (tts->gctx)  { gguf_free(tts->gctx); }
+    tts->sched.free_all();
     delete tts;
 }
