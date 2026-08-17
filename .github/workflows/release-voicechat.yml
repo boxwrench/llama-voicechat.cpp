@@ -78,9 +78,17 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target llama-voicechat llama-cli
 
+      # Do not pipe into Select-Object here: -First N stops the pipeline early,
+      # which kills the exe mid-write and fails the step on a good build.
       - name: Check llama-voicechat starts
         run: |
-          .\build\bin\Release\llama-voicechat.exe --help | Select-Object -First 5
+          $exe = '.\build\bin\Release\llama-voicechat.exe'
+          if (-not (Test-Path $exe)) { throw "$exe was not built" }
+          Get-ChildItem .\build\bin\Release\*.dll | Select-Object Name, Length | Format-Table -AutoSize
+          $out = & $exe --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "llama-voicechat --help exited $LASTEXITCODE" }
+          if ($out -notmatch '--tts') { throw 'llama-voicechat did not print its own flags' }
+          Write-Host "ok - $($out.Length) chars of usage"
 
       - name: Pack binaries
         run: |
