@@ -143,6 +143,20 @@ struct function_head {
     llama_token tok_sotc = -1, tok_eotc = -1, tok_eotr = -1;
     int64_t n_vocab = 0;
 
+    // Same projection + greedy argmax as the cpu path above, but W resident
+    // on a GPU backend and the argmax reduced on-device too, so only one i32
+    // token id crosses back to host instead of the full n_vocab logits row.
+    // Gated by VC_FHEAD_GPU=1; the cpu path is untouched and remains the
+    // fallback whenever a GPU backend cannot be opened.
+    bool            gpu       = false;
+    ggml_backend_t  gbackend  = nullptr;
+    ggml_backend_buffer_t gbuf = nullptr;
+    ggml_context  * gctx_g    = nullptr;   // device-side weight + io tensors + graph
+    ggml_cgraph   * ggf       = nullptr;
+    ggml_tensor   * ginp      = nullptr;
+    ggml_tensor   * gidx      = nullptr;   // argmax output, one i32
+    int64_t         n_embd_cached = 0;     // set in open(), before open_gpu() needs it
+
     static float kv_f32(gguf_context * g, const char * k, float def) {
         const int64_t i = gguf_find_key(g, k);
         return i < 0 ? def : gguf_get_val_f32(g, i);
@@ -158,6 +172,8 @@ struct function_head {
             return false;
         }
         fclose(probe);
+
+        n_embd_cached = n_embd;
 
         gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_w };
         gctx = gguf_init_from_file(fname.c_str(), gp);
@@ -198,11 +214,79 @@ struct function_head {
             work.resize(plan.work_size);
             plan.work_data = work.data();
         }
+
+        if (getenv("VC_FHEAD_GPU")) {
+            open_gpu(W);
+        }
         return true;
+    }
+
+    // VC_FHEAD_GPU=1: mirror function_head.weight onto a GPU backend once,
+    // build the fixed inp -> mul_mat -> argmax graph once, and reuse it every
+    // frame -- the same projection and greedy argmax as the cpu path, but W
+    // resident on device and the argmax reduced on-device too, so only one
+    // i32 token id crosses back to host instead of the full n_vocab logits
+    // row. Falls back silently to the cpu path (gpu stays false) if no GPU
+    // backend is available -- never a hard failure.
+    void open_gpu(ggml_tensor * W) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) {
+            LOG_ERR("%s: VC_FHEAD_GPU set but no GPU backend device found, staying on cpu\n", __func__);
+            return;
+        }
+        gbackend = ggml_backend_dev_init(dev, nullptr);
+        if (!gbackend) {
+            LOG_ERR("%s: cannot init GPU backend %s, staying on cpu\n", __func__, ggml_backend_dev_name(dev));
+            return;
+        }
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ 8 * ggml_tensor_overhead() + ggml_graph_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        gctx_g = ggml_init(ip);
+        ggml_tensor * gW = ggml_dup_tensor(gctx_g, W);
+        ggml_set_name(gW, "function_head.weight.gpu");
+        ginp = ggml_new_tensor_1d(gctx_g, GGML_TYPE_F32, n_embd_cached);
+        ggml_set_name(ginp, "fhead_hidden_in");
+        ggml_tensor * gout = ggml_mul_mat(gctx_g, gW, ginp);
+        gidx = ggml_argmax(gctx_g, gout);
+        ggf = ggml_new_graph(gctx_g);
+        ggml_build_forward_expand(ggf, gidx);
+
+        gbuf = ggml_backend_alloc_ctx_tensors(gctx_g, gbackend);
+        if (!gbuf) {
+            LOG_ERR("%s: failed to allocate function-head weight on GPU, staying on cpu\n", __func__);
+            ggml_free(gctx_g);
+            gctx_g = nullptr;
+            ggml_backend_free(gbackend);
+            gbackend = nullptr;
+            return;
+        }
+        ggml_backend_tensor_set(gW, W->data, 0, ggml_nbytes(W));
+
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        LOG_INF("%s: function-head mirrored to %s (%s), weight %.2f MiB, %.0f MiB free of %.0f MiB\n",
+                __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                ggml_nbytes(W) / 1048576.0, dev_free / 1048576.0, dev_total / 1048576.0);
+        gpu = true;
+    }
+
+    llama_token sample_gpu(const float * h) {
+        ggml_backend_tensor_set(ginp, h, 0, ggml_nbytes(ginp));
+        ggml_backend_graph_compute(gbackend, ggf);
+        int32_t idx = 0;
+        ggml_backend_tensor_get(gidx, &idx, 0, sizeof(idx));
+        return (llama_token) idx;
     }
 
     // greedy, as in the reference: the function channel is never temperature-sampled
     llama_token sample(const float * h) {
+        if (gpu) {
+            return sample_gpu(h);
+        }
         memcpy(inp->data, h, ggml_nbytes(inp));
         ggml_graph_compute(gf, &plan);
         const float * logits = (const float *) out->data;
@@ -216,6 +300,9 @@ struct function_head {
     }
 
     ~function_head() {
+        if (gbuf)     { ggml_backend_buffer_free(gbuf); }
+        if (gctx_g)   { ggml_free(gctx_g); }
+        if (gbackend) { ggml_backend_free(gbackend); }
         if (ctx_g) { ggml_free(ctx_g); }
         if (ctx_w) { ggml_free(ctx_w); }
         if (gctx)  { gguf_free(gctx); }
