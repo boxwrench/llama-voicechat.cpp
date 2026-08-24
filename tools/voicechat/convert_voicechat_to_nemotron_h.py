@@ -68,7 +68,10 @@ from typing import Any
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "gguf-py"))
+sys.path.insert(0, str(Path(__file__).parent))
 import gguf  # noqa: E402
+
+from vc_gguf import source_quantization  # noqa: E402
 
 logger = logging.getLogger("voicechat-convert")
 
@@ -291,6 +294,13 @@ def main() -> None:
                         format="%(levelname)s: %(message)s")
 
     src = GGUFSource(args.input)
+    quantization, inferred_file_type = source_quantization(src)
+    if inferred_file_type:
+        logger.warning("source has no general.file_type; inferred %s from quantized tensor elements", quantization)
+    output_file_type = {
+        "Q4_0": gguf.LlamaFileType.MOSTLY_Q4_0,
+        "Q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+    }[quantization]
     logger.info("source: %s", args.input)
     logger.info("  arch=%s tensors=%d", src.kv.get("general.architecture"), len(src.tensors))
 
@@ -369,7 +379,7 @@ def main() -> None:
     w.add_ssm_group_count(n_group)
     w.add_ssm_time_step_rank(n_ssm_head)  # llama.cpp stores the mamba2 head count here
 
-    w.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
+    w.add_file_type(output_file_type)
 
     # ---------------------------------------------------------------- vocab
 
@@ -531,6 +541,7 @@ def main() -> None:
         "Turn-taking / tool-call output head for llama-voicechat. Shares the STT LLM's "
         "vocabulary and hidden state; its output token is part of the next frame's input sum."
     )
+    fw.add_file_type(output_file_type)
 
     # weights of the per-frame input sum, from the NeMo AddFusion module
     fw.add_float32("voicechat.fusion.text_weight", float(stt_cfg.get("duplex_text_channel_weight", 1.0)))

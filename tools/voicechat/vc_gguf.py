@@ -46,6 +46,38 @@ def dequant_q4_0(raw: bytes, n_elements: int) -> np.ndarray:
     return out.reshape(-1)
 
 
+def dequant_q8_0(raw: bytes, n_elements: int) -> np.ndarray:
+    """Q8_0: per block of 32, one f16 scale then 32 signed bytes."""
+    n_blocks = n_elements // 32
+    b = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 34)
+    d = b[:, :2].copy().view(np.float16).astype(np.float32)
+    q = b[:, 2:].view(np.int8).astype(np.float32)
+    return (q * d).reshape(-1)
+
+
+def source_quantization(src: Any) -> tuple[str, bool]:
+    """Return Q4_0 or Q8_0 and whether it was inferred from tensor types."""
+    file_type = src.kv.get("general.file_type")
+    if file_type is not None:
+        by_file_type = {2: "Q4_0", 7: "Q8_0"}
+        if file_type not in by_file_type:
+            raise SystemExit(f"unsupported general.file_type {file_type}; expected Q4_0 or Q8_0")
+        return by_file_type[file_type], False
+
+    elements = {
+        ty: sum(t["elements"] for t in src.tensors.values() if t["ty"] == ty)
+        for ty in ("Q4_0", "Q8_0")
+    }
+    present = {ty: n for ty, n in elements.items() if n > 0}
+    if not present:
+        raise SystemExit("source has no Q4_0 or Q8_0 tensors and no general.file_type")
+
+    quantization = max(present, key=present.get)
+    if len(present) > 1 and len(set(present.values())) == 1:
+        raise SystemExit("source Q4_0 and Q8_0 tensor totals are tied; cannot infer file type")
+    return quantization, True
+
+
 class GGUFSource:
     def __init__(self, path: Path):
         self.path = path
@@ -143,6 +175,8 @@ class GGUFSource:
             a = np.frombuffer(self.raw(t), dtype=np.int64).astype(np.float32)
         elif t["ty"] == "Q4_0":
             a = dequant_q4_0(self.raw(t), t["elements"])
+        elif t["ty"] == "Q8_0":
+            a = dequant_q8_0(self.raw(t), t["elements"])
         else:
             raise SystemExit(f"{name}: cannot read {t['ty']} as float")
         return a.reshape(tuple(reversed(t["dims"])))

@@ -60,7 +60,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "gguf-py"))
 sys.path.insert(0, str(Path(__file__).parent))
 import gguf  # noqa: E402
 
-from vc_gguf import GGML_BLOCK, GGUFSource  # noqa: E402
+from vc_gguf import GGML_BLOCK, GGUFSource, source_quantization  # noqa: E402
 
 logger = logging.getLogger("voicechat-tts")
 
@@ -91,6 +91,13 @@ def main() -> None:
 
     src = GGUFSource(args.input)
     logger.info("source: %s (%d tensors)", args.input, len(src.tensors))
+    quantization, inferred_file_type = source_quantization(src)
+    if inferred_file_type:
+        logger.warning("source has no general.file_type; inferred %s from quantized tensor elements", quantization)
+    output_file_type = {
+        "Q4_0": gguf.LlamaFileType.MOSTLY_Q4_0,
+        "Q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+    }[quantization]
 
     gen = json.loads(src.kv["voicechat.config.model"])["speech_generation"]
     cfg = gen["model"]
@@ -120,7 +127,7 @@ def main() -> None:
     w.add_value_length(bb["head_dim"])
     w.add_sliding_window(bb["sliding_window"])
     w.add_layer_norm_rms_eps(1e-6)
-    w.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
+    w.add_file_type(output_file_type)
 
     # generator and codec hyper-parameters, under a private prefix
     kv = {
