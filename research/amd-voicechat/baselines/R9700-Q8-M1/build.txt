@@ -1,0 +1,12 @@
+runtime_source_commit=38a76719e2b31a4dfc574bf750bb9ad44c434b81
+baseline_branch=bench/r9700-q8-baseline
+ggml_cuda_init: found 3 ROCm devices (Total VRAM: 148496 MiB):
+  Device 0: Radeon RX 7900 XT, gfx1100 (0x1100), VMM: no, Wave Size: 32, VRAM: 20464 MiB
+  Device 1: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 2: AMD Radeon Graphics, gfx1036 (0x1036), VMM: no, Wave Size: 32, VRAM: 95408 MiB
+version: 0.1.0-dev (build 10440, commit f45001fc3)
+built with GNU 13.3.0 for Linux x86_64
+CMAKE_BUILD_TYPE:STRING=Release
+GGML_HIP:BOOL=ON
+GPU_TARGETS:UNINITIALIZED=gfx1201
+LLAMA_CURL:UNINITIALIZED=OFF

@@ -1,0 +1,1 @@
+{"location":"Seattle","temperature_f":68,"condition":"partly cloudy"}

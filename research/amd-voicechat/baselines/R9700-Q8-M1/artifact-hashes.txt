@@ -1,0 +1,5 @@
+47018a356c2d18ab4831ee2aa964a78baa35382f5d3c036697ccc248cde1479d  models/voicechat-q8/source/nemotron_voicechat_11b-Q8_0.gguf
+482ba5a6f92b483cdc816c8ed87798897cf9196a8976350fdc4b916d39609aa3  models/voicechat-q8/runtime/mmproj-voicechat-perception-Q8_0.gguf
+e68ff618cf00aa33c934167d2a834c7eebe8f55325613df19b0dd7b892b0a240  models/voicechat-q8/runtime/nemotron_voicechat_11b-stt-llm-Q8_0-function-head.gguf
+9b7ef9b6f30d179ff40f26eca613157e04b0b8e4989f34da4f355b8e18e20272  models/voicechat-q8/runtime/nemotron_voicechat_11b-stt-llm-Q8_0.gguf
+133ff0267b9056d628619666c454f4425f33577723fe12b02c2f6a79c4b90843  models/voicechat-q8/runtime/voicechat-tts-Q8_0.gguf

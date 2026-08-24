@@ -1,0 +1,22 @@
+# All paths are relative to the repository root.
+
+# Stable R9700 environment
+ROCR_VISIBLE_DEVICES=1
+GGML_CUDA_DISABLE_GRAPHS=1
+VC_NO_BARGE=1
+VC_FORCE_BOS=1
+
+# Deterministic service command
+build/hip-gfx1201/bin/llama-voicechat \
+  -m models/voicechat-q8/runtime/nemotron_voicechat_11b-stt-llm-Q8_0.gguf \
+  --mmproj models/voicechat-q8/runtime/mmproj-voicechat-perception-Q8_0.gguf \
+  --tts models/voicechat-q8/runtime/voicechat-tts-Q8_0.gguf \
+  --serve --no-warmup --device ROCm0 --split-mode none --gpu-layers all \
+  --temp 0 --seed 42
+
+# Primary benchmark harness
+python3 research/amd-voicechat/scripts/bench_r9700_q8.py \
+  --audio research/amd-voicechat/corpus/VC01-short.wav \
+  --warmups 3 --runs 20 \
+  --output-dir research/amd-voicechat/baselines/R9700-Q8-M1/generated/primary
+

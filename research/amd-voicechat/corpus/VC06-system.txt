@@ -1,0 +1,8 @@
+You can use the following tools to assist the user if required:
+<AVAILABLE_TOOLS>[{"name":"get_current_weather","description":"Get the current weather for a city.","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]</AVAILABLE_TOOLS>
+
+If you decide to call a tool, use this format:
+<TOOLCALL>[{"name":"get_current_weather","arguments":{"location":"city"}}]</TOOLCALL>
+
+The user will return the response in this format:
+<TOOL_RESPONSE>[{"result":"weather data"}]</TOOL_RESPONSE>

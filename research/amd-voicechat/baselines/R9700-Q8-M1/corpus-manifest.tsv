@@ -1,0 +1,7 @@
+case	file	sha256	duration_seconds	purpose	frozen_transcript
+VC01	VC01-short.wav	b7dbfefaa7cb77b43ad9800e4685982df1f565b7f2d503258877e1dc03e27de5	2.960	short factual	What's the capital of France?
+VC02	VC02-conversation.wav	9e1c6a891dcaa9560dc42dde06c0503d06dabe1125aefce8be2bd928213f16a7	4.240	conversational	Explain why the sky looks blue in simple terms.
+VC03	VC03-long.wav	69b7dd4d43c717cf0b12ba3d0bf746e748b475204d12f6a990d17ffc8ad2dd13	28.240	long constrained input	Weekend itinerary request with accessibility, food, crowd, and schedule constraints.
+VC04	VC04-noisy.wav	93b3bd147e1b4d6470d41b2398923850bab93fc5091b1569f4280a17ac6e33d2	2.960	fixed pink-noise mix	What's the capital of France?
+VC05	VC05-pause.wav	54037e3e1626b06f56572c9bd0638024e8eb8db9ecd7bb5e562bc214fbe9b3bc	7.940	2.5 second internal pause	Could you explain ... how rainbows form?
+VC06	VC06-tool.wav	b73063616fbe860f7d2f865ea7342111db0141da5762c9b554f85a515c056b32	3.200	function channel	What is the weather in Seattle right now?

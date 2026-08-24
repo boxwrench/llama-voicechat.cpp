@@ -1,0 +1,60 @@
+2026-08-24T07:00:01-07:00
+Linux Nautilus 7.0.0-28-generic #28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 15:50:57 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen 7 9800X3D 8-Core Processor
+CPU family:                              26
+Model:                                   68
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Stepping:                                0
+Frequency boost:                         enabled
+CPU(s) scaling MHz:                      93%
+CPU max MHz:                             5271.6221
+CPU min MHz:                             603.3790
+BogoMIPS:                                9399.98
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze
+Virtualization:                          AMD-V
+L1d cache:                               384 KiB (8 instances)
+L1i cache:                               256 KiB (8 instances)
+L2 cache:                                8 MiB (8 instances)
+L3 cache:                                96 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-15
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB on VMEXIT
+               total        used        free      shared  buff/cache   available
+Mem:           186Gi       8.0Gi        18Gi       236Mi       162Gi       178Gi
+Swap:          8.0Gi       376Ki       8.0Gi
+rocm-core	7.2.1.70201-81~24.04
+rocm-hip-runtime	7.2.1.70201-81~24.04
+HIP version: 7.2.53211-e1a6bc5663
+AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.1 26084 f58b06dce1f9c15707c5f808fd002e18c2accf7e)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.2.1/lib/llvm/bin
+Configuration file: /opt/rocm-7.2.1/lib/llvm/bin/clang++.cfg
+{"card0": {"Unique ID": "0xbf7e76d952231e5a", "dcefclk clock speed:": "(200Mhz)", "dcefclk clock level:": "1", "fclk clock speed:": "(1000Mhz)", "fclk clock level:": "1", "mclk clock speed:": "(96Mhz)", "mclk clock level:": "0", "sclk clock speed:": "(49Mhz)", "sclk clock level:": "S", "socclk clock speed:": "(600Mhz)", "socclk clock level:": "1", "pcie clock level": "2 (16.0GT/s x8)", "Average Graphics Package Power (W)": "20.0", "GPU use (%)": "11", "VRAM Total Memory (B)": "21458059264", "VRAM Total Used Memory (B)": "1197219840", "Card Series": "Radeon RX 7900 XT", "Card Model": "0x744c", "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]", "Card SKU": "D70401", "Subsystem ID": "0x1002", "Device Rev": "0xcc", "Node ID": "1", "GUID": "23276", "GFX Version": "gfx1100"}, "card1": {"Unique ID": "0x2eb39d7393ac0942", "dcefclk clock speed:": "(219Mhz)", "dcefclk clock level:": "1", "fclk clock speed:": "(582Mhz)", "fclk clock level:": "1", "mclk clock speed:": "(96Mhz)", "mclk clock level:": "0", "sclk clock speed:": "(2350Mhz)", "sclk clock level:": "1", "socclk clock speed:": "(417Mhz)", "socclk clock level:": "0", "pcie clock level": "2 (32.0GT/s x8)", "Average Graphics Package Power (W)": "6.0", "GPU use (%)": "0", "VRAM Total Memory (B)": "34208743424", "VRAM Total Used Memory (B)": "59936768", "Card Series": "AMD Radeon AI PRO R9700", "Card Model": "0x7551", "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]", "Card SKU": "APM107573", "Subsystem ID": "0x5413", "Device Rev": "0xc0", "Node ID": "2", "GUID": "2277", "GFX Version": "gfx1201"}, "card2": {"Unique ID": "0x0", "mclk clock speed:": "(2600Mhz)", "mclk clock level:": "0", "sclk clock speed:": "(600Mhz)", "sclk clock level:": "0", "socclk clock speed:": "(1200Mhz)", "socclk clock level:": "1", "Current Socket Graphics Package Power (W)": "0.012", "GPU use (%)": "0", "VRAM Total Memory (B)": "2147483648", "VRAM Total Used Memory (B)": "55386112", "Card Series": "AMD Radeon Graphics", "Card Model": "0x13c0", "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]", "Card SKU": "RAPHAEL", "Subsystem ID": "0x364e", "Device Rev": "0xcb", "Node ID": "3", "GUID": "22365", "GFX Version": "gfx1036"}}
