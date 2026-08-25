@@ -2,8 +2,10 @@
 
 #define _USE_MATH_DEFINES // for M_PI
 #include <cmath>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <thread>
 #include <vector>
 #include <fstream>
@@ -281,6 +283,7 @@ struct filter_params {
     float   preemph         = 0.f;
     bool    use_natural_log = false;
     bool    norm_per_feature = false;
+    bool    skip_post_normalization = false;
     bool    use_magnitude   = false;  // |X| instead of |X|^2
     float   mel_floor       = 5.960464477539063e-08f;
 };
@@ -503,7 +506,7 @@ static bool log_mel_spectrogram(
                 out.data[(size_t)i * out.n_len + j] = 0.0;
             }
         }
-    } else if (!params.no_padding) {
+    } else if (!params.no_padding && !params.skip_post_normalization) {
         // Whisper-style clamping and normalization (NOT used by Gemma4)
         double mmax = -1e20;
         const size_t mel_size = (size_t)out.n_mel * (size_t)out.n_len;
@@ -859,9 +862,10 @@ void mtmd_audio_preprocessor_conformer::initialize() {
     cache.fill_mel_filterbank_matrix(hparams.n_mel_bins, hparams.audio_n_fft, hparams.audio_sample_rate);
 }
 
-bool mtmd_audio_preprocessor_conformer::preprocess(const float *                 samples,
-                                                   size_t                        n_samples,
-                                                   std::vector<mtmd_audio_mel> & output) {
+bool mtmd_audio_preprocessor_conformer::preprocess_impl(const float *                 samples,
+                                                        size_t                        n_samples,
+                                                        std::vector<mtmd_audio_mel> & output,
+                                                        bool                          normalize_per_feature) {
     // empty audio
     if (n_samples == 0) {
         return false;
@@ -876,7 +880,8 @@ bool mtmd_audio_preprocessor_conformer::preprocess(const float *                
     params.center_padding   = true;
     params.preemph          = 0.97f;
     params.use_natural_log  = true;
-    params.norm_per_feature = true;
+    params.norm_per_feature = normalize_per_feature;
+    params.skip_post_normalization = !normalize_per_feature;
 
     // make sure the cache is initialized
     GGML_ASSERT(!cache.sin_vals.empty());
@@ -893,6 +898,18 @@ bool mtmd_audio_preprocessor_conformer::preprocess(const float *                
 
     output.push_back(std::move(out_full));
     return true;
+}
+
+bool mtmd_audio_preprocessor_conformer::preprocess(const float *                 samples,
+                                                   size_t                        n_samples,
+                                                   std::vector<mtmd_audio_mel> & output) {
+    return preprocess_impl(samples, n_samples, output, true);
+}
+
+bool mtmd_audio_preprocessor_conformer::preprocess_raw(const float *                 samples,
+                                                       size_t                        n_samples,
+                                                       std::vector<mtmd_audio_mel> & output) {
+    return preprocess_impl(samples, n_samples, output, false);
 }
 
 //
@@ -1168,6 +1185,145 @@ void mtmd_audio_preprocessor_parakeet::initialize() {
     GGML_ASSERT(hparams.window.size() == (size_t)hparams.audio_window_len);
     GGML_ASSERT(hparams.window.size() <= (size_t) hparams.audio_n_fft);
     cache.hann_window = hparams.window;
+}
+
+bool mtmd_audio_preprocessor_parakeet::preprocess_streaming_exact(
+        const float * samples, size_t n_samples_in, size_t chunk_samples,
+        std::vector<mtmd_audio_mel> & output) {
+    if (samples == nullptr || n_samples_in == 0) {
+        return false;
+    }
+    if (chunk_samples == 0) {
+        chunk_samples = n_samples_in;
+    }
+    if (norm_per_feature) {
+        // This method is intentionally limited to the VoiceChat no-norm
+        // contract.  Full-utterance normalization is not streamable without
+        // changing the model's frontend semantics.
+        LOG_ERR("%s: exact streaming frontend requires norm_per_feature=false\n", __func__);
+        return false;
+    }
+
+    const int frame_size = hparams.audio_n_fft;
+    const int window_size = hparams.audio_window_len;
+    const int frame_step = hparams.audio_hop_len;
+    const int n_fft_bins = 1 + frame_size / 2;
+    const int window_pad_left = (frame_size - window_size) / 2;
+    const int window_left_context = frame_size / 2 - window_pad_left;
+    const float preemph = 0.97f;
+    const double eps = 5.960464477539063e-08;
+
+    GGML_ASSERT(frame_size > 0 && window_size > 0 && frame_step > 0);
+    GGML_ASSERT(window_size <= frame_size);
+    GGML_ASSERT((int) cache.hann_window.size() == window_size);
+    GGML_ASSERT((int64_t) cache.filters.data.size() ==
+                (int64_t) hparams.n_mel_bins * n_fft_bins);
+    GGML_ASSERT(!cache.sin_vals.empty() && !cache.cos_vals.empty());
+
+    mtmd_audio_mel out;
+    out.n_mel = hparams.n_mel_bins;
+    out.n_len = (int64_t) (n_samples_in / (size_t) frame_step) + 1;
+    out.n_len_org = out.n_len;
+    out.data.assign((size_t) out.n_mel * (size_t) out.n_len, 0.0f);
+
+    // The deque is the bounded waveform frontier.  Pre-emphasis is causal,
+    // so old raw samples are not needed after the corresponding STFT frame
+    // has been emitted; only the previous raw sample crosses chunk borders.
+    std::deque<float> preprocessed;
+    size_t base_index = 0;
+    size_t n_received = 0;
+    float previous_raw = 0.0f;
+    bool have_previous_raw = false;
+    int64_t next_frame = 0;
+
+    auto sample_at = [&](int64_t index) -> float {
+        if (index < 0 || index >= (int64_t) n_received) {
+            return 0.0f;
+        }
+        if (index < (int64_t) base_index ||
+            index >= (int64_t) base_index + (int64_t) preprocessed.size()) {
+            LOG_ERR("%s: streaming sample frontier lost index=%" PRId64
+                    " base=%zu received=%zu retained=%zu\n",
+                    __func__, index, base_index, n_received, preprocessed.size());
+            return 0.0f;
+        }
+        return preprocessed[(size_t) (index - (int64_t) base_index)];
+    };
+
+    auto emit_frame = [&](int64_t frame) {
+        std::vector<float> fft_in((size_t) frame_size * 2, 0.0f);
+        std::vector<float> fft_out((size_t) frame_size * 2 * 2 * 2, 0.0f);
+        const int64_t first_sample = frame * frame_step - window_left_context;
+
+        // This is the same centered window as worker_thread(): frame 0 reads
+        // original samples [-200, 199] for the 512/400 configuration.  The
+        // explicit zero lookup preserves startup and end-of-input padding.
+        for (int j = 0; j < window_size; ++j) {
+            fft_in[(size_t) window_pad_left + (size_t) j] =
+                cache.hann_window[(size_t) j] * sample_at(first_sample + j);
+        }
+        fft(cache, fft_in.data(), frame_size, fft_out.data());
+        for (int j = 0; j < n_fft_bins; ++j) {
+            fft_out[(size_t) j] = fft_out[(size_t) (2 * j + 0)] * fft_out[(size_t) (2 * j + 0)] +
+                                  fft_out[(size_t) (2 * j + 1)] * fft_out[(size_t) (2 * j + 1)];
+        }
+        for (int mel = 0; mel < out.n_mel; ++mel) {
+            double sum = 0.0;
+            int k = 0;
+            const size_t filter_base = (size_t) mel * (size_t) n_fft_bins;
+            for (k = 0; k < n_fft_bins - 3; k += 4) {
+                sum += fft_out[(size_t) k + 0] * cache.filters.data[filter_base + (size_t) k + 0] +
+                       fft_out[(size_t) k + 1] * cache.filters.data[filter_base + (size_t) k + 1] +
+                       fft_out[(size_t) k + 2] * cache.filters.data[filter_base + (size_t) k + 2] +
+                       fft_out[(size_t) k + 3] * cache.filters.data[filter_base + (size_t) k + 3];
+            }
+            for (; k < n_fft_bins; ++k) {
+                sum += fft_out[(size_t) k] * cache.filters.data[filter_base + (size_t) k];
+            }
+            out.data[(size_t) mel * (size_t) out.n_len + (size_t) frame] =
+                (float) std::log(sum + eps);
+        }
+    };
+
+    auto emit_ready = [&]() {
+        // A frame is ready once all of its 400 window samples have arrived.
+        // At end-of-input, the remaining frames are emitted below with the
+        // same explicit right-zero padding as the reference implementation.
+        while (next_frame < out.n_len &&
+               n_received >= (size_t) (next_frame * frame_step + window_size / 2)) {
+            emit_frame(next_frame++);
+            const int64_t keep_from = next_frame * frame_step - window_left_context;
+            while (!preprocessed.empty() && (int64_t) base_index < keep_from) {
+                preprocessed.pop_front();
+                ++base_index;
+            }
+        }
+    };
+
+    for (size_t offset = 0; offset < n_samples_in; offset += chunk_samples) {
+        const size_t end = std::min(n_samples_in, offset + chunk_samples);
+        for (size_t i = offset; i < end; ++i) {
+            const float raw = samples[i];
+            const float filtered = have_previous_raw ? raw - preemph * previous_raw : raw;
+            preprocessed.push_back(filtered);
+            previous_raw = raw;
+            have_previous_raw = true;
+            ++n_received;
+        }
+        emit_ready();
+    }
+
+    while (next_frame < out.n_len) {
+        emit_frame(next_frame++);
+        const int64_t keep_from = next_frame * frame_step - window_left_context;
+        while (!preprocessed.empty() && (int64_t) base_index < keep_from) {
+            preprocessed.pop_front();
+            ++base_index;
+        }
+    }
+
+    output.push_back(std::move(out));
+    return true;
 }
 
 bool mtmd_audio_preprocessor_parakeet::preprocess(const float * samples,

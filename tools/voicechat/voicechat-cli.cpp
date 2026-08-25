@@ -1323,6 +1323,9 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
 
     mtmd::bitmaps bitmaps;
     bitmaps.entries.push_back(std::move(bmp));
+    const float * research_pcm = bitmaps.entries[0].data()
+        ? reinterpret_cast<const float *>(bitmaps.entries[0].data()) : nullptr;
+    const size_t research_n_samples = bitmaps.entries[0].n_bytes() / sizeof(float);
     auto bitmaps_c_ptr = bitmaps.c_ptr();
 
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
@@ -1373,6 +1376,67 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
     if (!d2_stateful_embd.empty()) {
         aud.swap(d2_stateful_embd);
         LOG_INF("voicechat-d2: using bounded-state embeddings for research timeline only\n");
+    }
+
+    // D2 normalization bakeoff.  This is deliberately opt-in and runs after
+    // the normal encode so the default production path remains unchanged.
+    // The candidate function rebuilds the same mel shape from raw PCM, applies
+    // one named normalization policy, and feeds its pre-encoder output through
+    // the already-proven bounded encoder state.
+    if (const char * norm_policy = getenv("VC_D2_NORM_POLICY")) {
+        if (research_pcm == nullptr || research_n_samples == 0) {
+            ev.error("D2 normalization bakeoff has no raw PCM input");
+            return false;
+        }
+        std::vector<float> norm_embd((size_t) n_frames * n_embd);
+        int32_t norm_frames = 0;
+        mtmd_voicechat_d2_metrics norm_metrics{};
+        if (!mtmd_voicechat_d2_normalized_stateful(
+                ctx_mtmd.get(), research_pcm, research_n_samples, norm_policy,
+                norm_embd.data(), &norm_frames, &norm_metrics) ||
+            norm_frames != n_frames) {
+            ev.error("D2 normalization bakeoff failed for policy " + std::string(norm_policy));
+            return false;
+        }
+        LOG_INF("voicechat-d2-norm: policy=%s frames=%d state_bytes=%zu "
+                "mean_step_us=%" PRId64 " p95_step_us=%" PRId64 " p99_step_us=%" PRId64 "\n",
+                norm_policy, norm_frames, norm_metrics.state_bytes,
+                norm_metrics.mean_step_us, norm_metrics.p95_step_us, norm_metrics.p99_step_us);
+        aud.swap(norm_embd);
+        LOG_INF("voicechat-d2-norm: using policy=%s embeddings for research timeline only\n", norm_policy);
+    }
+
+    // D2 frontend mapping experiment.  This is mutually exclusive with the
+    // normalization bakeoff: it uses the authoritative VoiceChat no-norm
+    // frontend and the exact 15-mel-frame causal preencoder frontier.
+    if (getenv("VC_D2_STREAMING_FRONTEND")) {
+        if (research_pcm == nullptr || research_n_samples == 0) {
+            ev.error("D2 streaming frontend has no raw PCM input");
+            return false;
+        }
+        std::vector<float> frontend_embd((size_t) n_frames * n_embd);
+        int32_t frontend_frames = 0;
+        mtmd_voicechat_d2_metrics frontend_metrics{};
+        if (!mtmd_voicechat_d2_streaming_frontend(
+                ctx_mtmd.get(), research_pcm, research_n_samples,
+                frontend_embd.data(), &frontend_frames, &frontend_metrics) ||
+            frontend_frames != n_frames) {
+            ev.error("D2 streaming frontend failed");
+            return false;
+        }
+        LOG_INF("voicechat-d2-frontend: frames=%d state_bytes=%zu "
+                "preenc_min_cos=%.9f preenc_rmse=%.6g preenc_abs=%.6g "
+                "embd_min_cos=%.9f embd_rmse=%.6g embd_abs=%.6g "
+                "mean_step_us=%" PRId64 " p95_step_us=%" PRId64 " p99_step_us=%" PRId64 "\n",
+                frontend_frames, frontend_metrics.state_bytes,
+                frontend_metrics.min_preenc_cosine, frontend_metrics.max_preenc_rmse,
+                frontend_metrics.max_preenc_abs, frontend_metrics.min_cosine,
+                frontend_metrics.max_rmse, frontend_metrics.max_abs,
+                frontend_metrics.mean_step_us, frontend_metrics.p95_step_us,
+                frontend_metrics.p99_step_us);
+        aud.swap(frontend_embd);
+        LOG_INF("voicechat-d2-frontend: using bounded causal preencoder embeddings "
+                "for research timeline only\n");
     }
 
     LOG_INF("perception: %d frames (%.2f s at 12.5 Hz) in %" PRId64 " ms\n",

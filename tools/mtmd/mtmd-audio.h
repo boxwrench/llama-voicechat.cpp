@@ -74,8 +74,17 @@ struct mtmd_audio_preprocessor_conformer : mtmd_audio_preprocessor {
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
 
+    // Research-only: emit the source-equivalent log-mel tensor before the
+    // VoiceChat full-utterance per-feature normalization.  The production
+    // preprocess() path remains unchanged.
+    bool preprocess_raw(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output);
+
   private:
     mtmd_audio_cache cache;
+
+    bool preprocess_impl(const float * samples, size_t n_samples,
+                         std::vector<mtmd_audio_mel> & output,
+                         bool normalize_per_feature);
 };
 
 struct mtmd_audio_preprocessor_granite_speech : mtmd_audio_preprocessor {
@@ -143,6 +152,14 @@ struct mtmd_audio_preprocessor_parakeet : mtmd_audio_preprocessor {
         : mtmd_audio_preprocessor(ctx), norm_per_feature(norm_per_feature) { }
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
+
+    // Research-only bounded frontend probe.  It delivers the same PCM in
+    // chunks, retaining only the causal pre-emphasis boundary and the
+    // waveform samples needed by the next centered STFT frame.  The result
+    // must match preprocess() for the no-normalization VoiceChat contract.
+    bool preprocess_streaming_exact(const float * samples, size_t n_samples,
+                                    size_t chunk_samples,
+                                    std::vector<mtmd_audio_mel> & output);
 
   private:
     bool norm_per_feature;

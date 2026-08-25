@@ -314,12 +314,39 @@ struct mtmd_voicechat_d2_metrics {
     int64_t mean_step_us;
     int64_t p95_step_us;
     int64_t p99_step_us;
+    float   min_preenc_cosine;
+    float   max_preenc_rmse;
+    float   max_preenc_abs;
+    int32_t first_bad_mel_frame;
+    float   min_mel_cosine;
+    float   max_mel_rmse;
+    float   max_mel_abs;
 };
 
 MTMD_API bool mtmd_voicechat_d2_compare(mtmd_context * ctx,
                                         const mtmd_input_chunk * chunk,
                                         struct mtmd_voicechat_d2_metrics * metrics,
                                         float * stateful_embd_out);
+
+// Research-only normalization bakeoff.  The default mtmd path is untouched.
+// `policy` names an offline causal-normalization candidate such as N0, N1,
+// N2-100, N3-0.05, N5-100, or N6.  The output is the candidate's embeddings
+// after the existing bounded VoiceChat encoder prototype.
+MTMD_API bool mtmd_voicechat_d2_normalized_stateful(
+        mtmd_context * ctx, const float * samples, size_t n_samples,
+        const char * policy, float * stateful_embd_out, int32_t * n_frames_out,
+        struct mtmd_voicechat_d2_metrics * metrics);
+
+// Research-only complete frontend experiment for the authoritative VoiceChat
+// no-normalization path.  It delivers PCM in bounded chunks through the exact
+// centered Parakeet STFT/mel frontier, then uses the source-derived causal mel
+// frontier (raw mel rows [8k-14, 8k]) and the existing graph for each bounded
+// preencoder window.  It feeds one preenc row at a time into the D2-S1
+// bounded encoder.  It is not part of the normal mtmd encode path.
+MTMD_API bool mtmd_voicechat_d2_streaming_frontend(
+        mtmd_context * ctx, const float * samples, size_t n_samples,
+        float * stateful_embd_out, int32_t * n_frames_out,
+        struct mtmd_voicechat_d2_metrics * metrics);
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:

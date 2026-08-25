@@ -1091,6 +1091,7 @@ struct clip_voicechat_stream {
     std::vector<std::vector<float>> k_hist;
     std::vector<std::vector<float>> v_hist;
     std::vector<std::vector<float>> conv_hist;
+    int64_t step_index = 0;
 };
 
 clip_voicechat_stream * clip_voicechat_stream_init(clip_ctx * ctx, int n_threads) {
@@ -1131,11 +1132,16 @@ bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * pr
     if (stream == nullptr || preenc == nullptr) {
         return false;
     }
+    const bool decompose = std::getenv("VC_D2_DECOMPOSE") != nullptr;
+    const int64_t t_total = ggml_time_us();
     int n_hist = stream->k_hist.empty() ? 0 : (int) stream->k_hist[0].size() / stream->n_state;
+    const int64_t t_build = ggml_time_us();
     clip_graph_voicechat_stream builder(stream->ctx, n_hist);
     ggml_cgraph * gf = builder.build();
+    const int64_t t_built = ggml_time_us();
     ggml_backend_sched_reset(stream->ctx->sched.get());
     ggml_backend_sched_alloc_graph(stream->ctx->sched.get(), gf);
+    const int64_t t_allocated = ggml_time_us();
 
     auto set_input = [&](const std::string & name, const float * data, size_t n) {
         ggml_tensor * tensor = ggml_graph_get_tensor(gf, name.c_str());
@@ -1167,12 +1173,14 @@ bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * pr
             set_input("vc_stream_l" + std::to_string(il) + "_k_hist", stream->k_hist[il].data(), stream->k_hist[il].size());
             set_input("vc_stream_l" + std::to_string(il) + "_v_hist", stream->v_hist[il].data(), stream->v_hist[il].size());
         }
-        set_input("vc_stream_l" + std::to_string(il) + "_conv_hist", stream->conv_hist[il].data(), stream->conv_hist[il].size());
+    set_input("vc_stream_l" + std::to_string(il) + "_conv_hist", stream->conv_hist[il].data(), stream->conv_hist[il].size());
     }
+    const int64_t t_inputs = ggml_time_us();
 
     if (ggml_backend_sched_graph_compute(stream->ctx->sched.get(), gf) != GGML_STATUS_SUCCESS) {
         return false;
     }
+    const int64_t t_computed = ggml_time_us();
 
     auto get_output = [&](const std::string & name, std::vector<float> & dst) {
         ggml_tensor * tensor = ggml_graph_get_tensor(gf, name.c_str());
@@ -1207,6 +1215,16 @@ bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * pr
         std::memcpy(ch.data() + ch.size() - conv_frame, next_conv[il].data(),
                     std::min(conv_frame, next_conv[il].size()) * sizeof(float));
     }
+    const int64_t t_finished = ggml_time_us();
+    if (decompose) {
+        LOG_INF("D2DECOMP step=%" PRId64 " hist=%d build_us=%" PRId64
+                " alloc_us=%" PRId64 " input_us=%" PRId64 " compute_us=%" PRId64
+                " output_state_us=%" PRId64 " total_us=%" PRId64 "\n",
+                stream->step_index, n_hist,
+                t_built - t_build, t_allocated - t_built, t_inputs - t_allocated,
+                t_computed - t_inputs, t_finished - t_computed, t_finished - t_total);
+    }
+    ++stream->step_index;
     return true;
 }
 

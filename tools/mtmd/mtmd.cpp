@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <cctype>
 #include <type_traits>
 #include <vector>
 
@@ -1891,6 +1892,510 @@ bool mtmd_voicechat_d2_compare(mtmd_context * ctx, const mtmd_input_chunk * chun
     metrics->mean_step_us = total_us / n_frames;
     metrics->p95_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.95) - 1)];
     metrics->p99_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.99) - 1)];
+    return true;
+}
+
+// The production conformer uses full-utterance per-feature statistics.  This
+// helper is deliberately isolated behind the research API below so that the
+// normalization bakeoff cannot change normal mtmd inference.
+static bool d2_parse_norm_policy(const char * policy, std::string & kind, double & value) {
+    if (policy == nullptr || *policy == '\0') {
+        return false;
+    }
+    std::string p(policy);
+    for (char & c : p) {
+        c = (char) std::toupper((unsigned char) c);
+    }
+
+    const size_t dash = p.find('-');
+    kind = dash == std::string::npos ? p : p.substr(0, dash);
+    value = 0.0;
+    if (dash != std::string::npos) {
+        try {
+            value = std::stod(p.substr(dash + 1));
+        } catch (...) {
+            return false;
+        }
+    }
+    if (kind == "N0" || kind == "N1" || kind == "N4" || kind == "N6") {
+        return dash == std::string::npos;
+    }
+    if (kind == "N2" || kind == "N5") {
+        return dash != std::string::npos && value >= 1.0;
+    }
+    if (kind == "N3") {
+        return dash != std::string::npos && value > 0.0 && value <= 1.0;
+    }
+    return false;
+}
+
+static void d2_normalize_mel(mtmd_audio_mel & mel, const std::string & kind, double policy_value) {
+    const int64_t effective_n_len = std::min<int64_t>(
+        mel.n_len, std::max<int64_t>(0, mel.n_len_org / 160));
+    const double eps = 1e-5;
+
+    auto set_value = [&](int64_t feature, int64_t frame, double mean, double var) {
+        float & out = mel.data[(size_t) feature * (size_t) mel.n_len + (size_t) frame];
+        out = (float) ((out - mean) / std::sqrt(std::max(0.0, var) + eps));
+    };
+    auto zero_tail = [&](int64_t feature) {
+        for (int64_t frame = effective_n_len; frame < mel.n_len; ++frame) {
+            mel.data[(size_t) feature * (size_t) mel.n_len + (size_t) frame] = 0.0f;
+        }
+    };
+
+    for (int64_t feature = 0; feature < mel.n_mel; ++feature) {
+        const size_t base = (size_t) feature * (size_t) mel.n_len;
+        if (kind == "N6") {
+            zero_tail(feature);
+            continue;
+        }
+
+        if (effective_n_len <= 0) {
+            zero_tail(feature);
+            continue;
+        }
+
+        if (kind == "N0") {
+            double mean = 0.0;
+            for (int64_t frame = 0; frame < effective_n_len; ++frame) {
+                mean += mel.data[base + (size_t) frame];
+            }
+            mean /= effective_n_len;
+            double var = 0.0;
+            for (int64_t frame = 0; frame < effective_n_len; ++frame) {
+                const double delta = mel.data[base + (size_t) frame] - mean;
+                var += delta * delta;
+            }
+            var /= std::max<int64_t>(1, effective_n_len - 1);
+            for (int64_t frame = 0; frame < effective_n_len; ++frame) {
+                set_value(feature, frame, mean, var);
+            }
+            zero_tail(feature);
+            continue;
+        }
+
+        if (kind == "N1" || kind == "N5") {
+            const int64_t calibration = kind == "N5"
+                ? std::min<int64_t>(effective_n_len, (int64_t) policy_value)
+                : effective_n_len;
+            double frozen_mean = 0.0;
+            double frozen_var = 0.0;
+            if (kind == "N5") {
+                for (int64_t frame = 0; frame < calibration; ++frame) {
+                    frozen_mean += mel.data[base + (size_t) frame];
+                }
+                frozen_mean /= calibration;
+                for (int64_t frame = 0; frame < calibration; ++frame) {
+                    const double delta = mel.data[base + (size_t) frame] - frozen_mean;
+                    frozen_var += delta * delta;
+                }
+                frozen_var /= std::max<int64_t>(1, calibration - 1);
+            }
+            double mean = 0.0;
+            double m2 = 0.0;
+            for (int64_t frame = 0; frame < effective_n_len; ++frame) {
+                const double x = mel.data[base + (size_t) frame];
+                if (kind == "N5" && frame >= calibration) {
+                    set_value(feature, frame, frozen_mean, frozen_var);
+                    continue;
+                }
+                const int64_t count = frame + 1;
+                const double delta = x - mean;
+                mean += delta / count;
+                m2 += delta * (x - mean);
+                const int64_t stats_count = kind == "N5"
+                    ? std::min<int64_t>(count, calibration) : count;
+                const double var = m2 / std::max<int64_t>(1, stats_count - 1);
+                set_value(feature, frame, mean, var);
+            }
+            zero_tail(feature);
+            continue;
+        }
+
+        if (kind == "N2") {
+            const int64_t window = std::max<int64_t>(1, (int64_t) policy_value);
+            for (int64_t frame = 0; frame < effective_n_len; ++frame) {
+                const int64_t first = std::max<int64_t>(0, frame - window + 1);
+                const int64_t count = frame - first + 1;
+                double mean = 0.0;
+                for (int64_t k = first; k <= frame; ++k) {
+                    mean += mel.data[base + (size_t) k];
+                }
+                mean /= count;
+                double var = 0.0;
+                for (int64_t k = first; k <= frame; ++k) {
+                    const double delta = mel.data[base + (size_t) k] - mean;
+                    var += delta * delta;
+                }
+                var /= std::max<int64_t>(1, count - 1);
+                set_value(feature, frame, mean, var);
+            }
+            zero_tail(feature);
+            continue;
+        }
+
+        // N3: exponentially weighted running mean/variance.  The current
+        // frame updates the state before it is normalized, so startup is
+        // finite and deterministic rather than depending on future audio.
+        if (kind == "N3") {
+            const double alpha = policy_value;
+            double mean = mel.data[base];
+            double var = 0.0;
+            mel.data[base] = 0.0f;
+            for (int64_t frame = 1; frame < effective_n_len; ++frame) {
+                const double x = mel.data[base + (size_t) frame];
+                const double delta = x - mean;
+                mean += alpha * delta;
+                var = (1.0 - alpha) * (var + alpha * delta * delta);
+                set_value(feature, frame, mean, var);
+            }
+            zero_tail(feature);
+        }
+    }
+}
+
+bool mtmd_voicechat_d2_normalized_stateful(
+        mtmd_context * ctx, const float * samples, size_t n_samples,
+        const char * policy, float * stateful_embd_out, int32_t * n_frames_out,
+        mtmd_voicechat_d2_metrics * metrics) {
+    if (n_frames_out == nullptr || metrics == nullptr || ctx == nullptr ||
+        samples == nullptr || n_samples == 0 || ctx->ctx_a == nullptr ||
+        clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
+        return false;
+    }
+    *n_frames_out = 0;
+    *metrics = {};
+    metrics->first_bad_frame = -1;
+    metrics->min_cosine = 1.0f;
+
+    std::string kind;
+    double policy_value = 0.0;
+    if (!d2_parse_norm_policy(policy, kind, policy_value)) {
+        LOG_ERR("%s: unsupported normalization policy '%s'\n", __func__, policy ? policy : "(null)");
+        return false;
+    }
+    if (kind == "N4") {
+        LOG_ERR("%s: N4 requires external frozen/global calibration statistics\n", __func__);
+        return false;
+    }
+
+    auto * parakeet = dynamic_cast<mtmd_audio_preprocessor_parakeet *>(ctx->audio_preproc.get());
+    auto * conformer = dynamic_cast<mtmd_audio_preprocessor_conformer *>(ctx->audio_preproc.get());
+    std::vector<mtmd_audio_mel> raw_chunks;
+    // VoiceChat's authoritative path is Parakeet with norm_per_feature=false;
+    // its normal preprocess() output is therefore already the unnormalized
+    // log-mel tensor.  The conformer branch is retained only for experiments
+    // against other projector configurations.
+    const bool preprocessed = parakeet != nullptr
+        ? parakeet->preprocess(samples, n_samples, raw_chunks)
+        : conformer != nullptr
+            ? conformer->preprocess_raw(samples, n_samples, raw_chunks)
+            : false;
+    if (!preprocessed || raw_chunks.size() != 1) {
+        LOG_ERR("%s: unsupported VoiceChat frontend type for normalization bakeoff\n", __func__);
+        return false;
+    }
+    // mtmd_audio_preprocessor_parakeet stores n_len_org as its output frame
+    // count; the bakeoff needs the original sample count for the same valid
+    // frame rule used by its normalization implementation.
+    raw_chunks[0].n_len_org = (int64_t) n_samples;
+    d2_normalize_mel(raw_chunks[0], kind, policy_value);
+
+    clip_image_f32 mel_f32;
+    mel_f32.set_size({(int) raw_chunks[0].n_len, (int) raw_chunks[0].n_mel}, false, true);
+    mel_f32.cpy_buf(raw_chunks[0].data);
+    const int n_frames = clip_n_output_tokens(ctx->ctx_a, &mel_f32);
+    *n_frames_out = n_frames;
+    if (n_frames <= 0) {
+        return false;
+    }
+
+    clip_image_f32_batch batch;
+    batch.is_audio = true;
+    batch.entries.push_back(std::move(mel_f32));
+    std::vector<float> ignored_embd;
+    std::vector<float> preenc;
+    if (!clip_image_batch_encode_with_preenc(ctx->ctx_a, ctx->n_threads,
+                                              &batch, ignored_embd, preenc) ||
+        preenc.empty() || preenc.size() % (size_t) n_frames != 0) {
+        return false;
+    }
+    std::unique_ptr<clip_voicechat_stream, decltype(&clip_voicechat_stream_free)> stream(
+        clip_voicechat_stream_init(ctx->ctx_a, ctx->n_threads), clip_voicechat_stream_free);
+    if (!stream) {
+        return false;
+    }
+    const size_t preenc_width = preenc.size() / (size_t) n_frames;
+    const int n_embd = clip_n_mmproj_embd(ctx->ctx_a);
+    std::vector<int64_t> step_us;
+    step_us.reserve(n_frames);
+    for (int frame = 0; frame < n_frames; ++frame) {
+        const int64_t t0 = ggml_time_us();
+        std::vector<float> step_embd;
+        if (!clip_voicechat_stream_step(stream.get(),
+                                        preenc.data() + (size_t) frame * preenc_width,
+                                        step_embd) || (int) step_embd.size() != n_embd) {
+            return false;
+        }
+        step_us.push_back(ggml_time_us() - t0);
+        if (stateful_embd_out != nullptr) {
+            std::memcpy(stateful_embd_out + (size_t) frame * n_embd,
+                        step_embd.data(), (size_t) n_embd * sizeof(float));
+        }
+    }
+    std::sort(step_us.begin(), step_us.end());
+    int64_t total_us = 0;
+    for (int64_t value : step_us) {
+        total_us += value;
+    }
+    metrics->n_frames = n_frames;
+    metrics->state_bytes = clip_voicechat_stream_state_bytes(stream.get());
+    metrics->mean_step_us = total_us / n_frames;
+    metrics->p95_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.95) - 1)];
+    metrics->p99_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.99) - 1)];
+    return true;
+}
+
+bool mtmd_voicechat_d2_streaming_frontend(
+        mtmd_context * ctx, const float * samples, size_t n_samples,
+        float * stateful_embd_out, int32_t * n_frames_out,
+        mtmd_voicechat_d2_metrics * metrics) {
+    if (n_frames_out == nullptr || metrics == nullptr || ctx == nullptr ||
+        samples == nullptr || n_samples == 0 || ctx->ctx_a == nullptr ||
+        clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
+        return false;
+    }
+    *n_frames_out = 0;
+    *metrics = {};
+    metrics->first_bad_frame = -1;
+    metrics->min_cosine = 1.0f;
+    metrics->min_preenc_cosine = 1.0f;
+    metrics->first_bad_mel_frame = -1;
+    metrics->min_mel_cosine = 1.0f;
+
+    auto * parakeet = dynamic_cast<mtmd_audio_preprocessor_parakeet *>(ctx->audio_preproc.get());
+    if (parakeet == nullptr) {
+        LOG_ERR("%s: VoiceChat context does not expose the Parakeet frontend\n", __func__);
+        return false;
+    }
+
+    std::vector<mtmd_audio_mel> oracle_chunks;
+    if (!parakeet->preprocess(samples, n_samples, oracle_chunks) || oracle_chunks.size() != 1) {
+        return false;
+    }
+    std::vector<mtmd_audio_mel> raw_chunks;
+    size_t chunk_samples = 1280; // one 80 ms VoiceChat timeline quantum
+    if (const char * chunk_env = std::getenv("VC_D2_FRONTEND_CHUNK")) {
+        char * end = nullptr;
+        const unsigned long parsed = std::strtoul(chunk_env, &end, 10);
+        if (end != chunk_env && *end == '\0' && parsed > 0) {
+            chunk_samples = (size_t) parsed;
+        }
+    }
+    if (!parakeet->preprocess_streaming_exact(samples, n_samples, chunk_samples, raw_chunks) ||
+        raw_chunks.size() != 1) {
+        return false;
+    }
+    const mtmd_audio_mel & raw = raw_chunks.front();
+    const mtmd_audio_mel & oracle_raw = oracle_chunks.front();
+    if (raw.n_mel != oracle_raw.n_mel || raw.n_len != oracle_raw.n_len ||
+        raw.data.size() != oracle_raw.data.size()) {
+        LOG_ERR("%s: streaming/oracle mel shape mismatch streaming=[%" PRId64 ",%" PRId64 "] "
+                "oracle=[%" PRId64 ",%" PRId64 "]\n",
+                __func__, raw.n_mel, raw.n_len, oracle_raw.n_mel, oracle_raw.n_len);
+        return false;
+    }
+    for (int64_t frame = 0; frame < raw.n_len; ++frame) {
+        double dot = 0.0;
+        double norm_a = 0.0;
+        double norm_b = 0.0;
+        double sum_sq = 0.0;
+        float frame_max_abs = 0.0f;
+        for (int mel = 0; mel < raw.n_mel; ++mel) {
+            const size_t index = (size_t) mel * (size_t) raw.n_len + (size_t) frame;
+            const double a = oracle_raw.data[index];
+            const double b = raw.data[index];
+            const float diff = std::abs((float) (a - b));
+            dot += a * b;
+            norm_a += a * a;
+            norm_b += b * b;
+            sum_sq += (double) diff * diff;
+            frame_max_abs = std::max(frame_max_abs, diff);
+            if (metrics->first_bad_mel_frame < 0 && diff > 1e-5f) {
+                metrics->first_bad_mel_frame = (int32_t) frame;
+            }
+        }
+        const float cosine = (norm_a > 0.0 && norm_b > 0.0)
+            ? (float) (dot / std::sqrt(norm_a * norm_b)) : 0.0f;
+        metrics->min_mel_cosine = std::min(metrics->min_mel_cosine, cosine);
+        metrics->max_mel_rmse = std::max(metrics->max_mel_rmse,
+            (float) std::sqrt(sum_sq / raw.n_mel));
+        metrics->max_mel_abs = std::max(metrics->max_mel_abs, frame_max_abs);
+    }
+    LOG_INF("%s: frontend_chunk_samples=%zu mel_first_bad=%d mel_min_cos=%.9f "
+            "mel_rmse=%.6g mel_abs=%.6g\n", __func__, chunk_samples,
+            metrics->first_bad_mel_frame, metrics->min_mel_cosine,
+            metrics->max_mel_rmse, metrics->max_mel_abs);
+
+    // Full-prefix oracle: this is used only for parity diagnostics.  The
+    // candidate path below never consumes its preencoder output.
+    clip_image_f32 full_image;
+    full_image.set_size({(int) raw.n_len, (int) raw.n_mel}, false, true);
+    full_image.cpy_buf(raw.data);
+    const int n_frames = clip_n_output_tokens(ctx->ctx_a, &full_image);
+    *n_frames_out = n_frames;
+    if (n_frames <= 0) {
+        return false;
+    }
+    clip_image_f32_batch full_batch;
+    full_batch.is_audio = true;
+    full_batch.entries.push_back(std::move(full_image));
+    std::vector<float> prefix_embd((size_t) n_frames * (size_t) clip_n_mmproj_embd(ctx->ctx_a));
+    std::vector<float> prefix_preenc;
+    if (!clip_image_batch_encode_with_preenc(ctx->ctx_a, ctx->n_threads,
+                                              &full_batch, prefix_embd, prefix_preenc) ||
+        prefix_preenc.empty() || prefix_preenc.size() % (size_t) n_frames != 0 ||
+        prefix_embd.size() != (size_t) n_frames * (size_t) clip_n_mmproj_embd(ctx->ctx_a)) {
+        return false;
+    }
+    const size_t preenc_width = prefix_preenc.size() / (size_t) n_frames;
+    const int n_embd = clip_n_mmproj_embd(ctx->ctx_a);
+
+    std::unique_ptr<clip_voicechat_stream, decltype(&clip_voicechat_stream_free)> stream(
+        clip_voicechat_stream_init(ctx->ctx_a, ctx->n_threads), clip_voicechat_stream_free);
+    if (!stream) {
+        return false;
+    }
+    std::vector<int64_t> step_us;
+    step_us.reserve(n_frames);
+    int first_bad_preenc = -1;
+    // The composed receptive field is raw mel [8k-14, 8k].  Use a 33-row
+    // aligned standalone graph so the target is local output index 4; its
+    // local receptive field [18, 32] maps exactly to those global rows.  The
+    // larger diagnostic window makes the residue alignment explicit while
+    // remaining bounded; it is not a production shape.
+    constexpr int frontier_frames = 33;
+    for (int frame = 0; frame < n_frames; ++frame) {
+        // Warm the local window from session start.  Once four output rows are
+        // available, shift a fixed window by eight raw mel rows per target.
+        // This keeps the local graph's boundary away from the target in the
+        // steady state while preserving the true session-start padding.
+        const int local_target = std::min(frame, 4);
+        const int first_mel = frame < 4 ? 0 : 8 * (frame - 4);
+        // At end-of-input, do not materialize missing rows as ordinary input:
+        // the production graph applies right padding after each subsampling
+        // stage, and ReLU/bias makes that different from passing zero rows
+        // through earlier stages.
+        const int window_frames = std::min(frontier_frames,
+            std::max(1, (int) raw.n_len - first_mel));
+        std::vector<float> window((size_t) raw.n_mel * window_frames, 0.0f);
+        for (int mel_bin = 0; mel_bin < raw.n_mel; ++mel_bin) {
+            for (int local = 0; local < window_frames; ++local) {
+                const int source = first_mel + local;
+                if (source >= 0 && source < raw.n_len) {
+                    window[(size_t) mel_bin * window_frames + (size_t) local] =
+                        raw.data[(size_t) mel_bin * (size_t) raw.n_len + (size_t) source];
+                }
+            }
+        }
+
+        clip_image_f32 local_image;
+        local_image.set_size({window_frames, (int) raw.n_mel}, false, true);
+        local_image.cpy_buf(window);
+        clip_image_f32_batch local_batch;
+        local_batch.is_audio = true;
+        local_batch.entries.push_back(std::move(local_image));
+        std::vector<float> ignored_embd;
+        std::vector<float> local_preenc;
+        const bool local_ok = clip_image_batch_encode_with_preenc(ctx->ctx_a, ctx->n_threads,
+                                                  &local_batch, ignored_embd, local_preenc);
+        if (!local_ok || local_preenc.empty() || local_preenc.size() % preenc_width != 0) {
+            LOG_ERR("%s: bounded preencoder failed at frame %d ok=%d preenc=%zu width=%zu\n",
+                    __func__, frame, local_ok, local_preenc.size(), preenc_width);
+            return false;
+        }
+        const size_t local_frames = local_preenc.size() / preenc_width;
+        if (local_frames <= 4) {
+            return false;
+        }
+        const float * candidate_preenc = local_preenc.data() + (size_t) local_target * preenc_width;
+
+        double dot = 0.0;
+        double ref_norm = 0.0;
+        double got_norm = 0.0;
+        double preenc_sq = 0.0;
+        float preenc_max_abs = 0.0f;
+        for (size_t i = 0; i < preenc_width; ++i) {
+            const double a = prefix_preenc[(size_t) frame * preenc_width + i];
+            const double b = candidate_preenc[i];
+            dot += a * b;
+            ref_norm += a * a;
+            got_norm += b * b;
+            const float diff = std::abs((float) (a - b));
+            preenc_sq += (double) diff * diff;
+            preenc_max_abs = std::max(preenc_max_abs, diff);
+        }
+        const float preenc_cos = (ref_norm > 0.0 && got_norm > 0.0)
+            ? (float) (dot / std::sqrt(ref_norm * got_norm)) : 0.0f;
+        metrics->min_preenc_cosine = std::min(metrics->min_preenc_cosine, preenc_cos);
+        metrics->max_preenc_rmse = std::max(metrics->max_preenc_rmse,
+            (float) std::sqrt(preenc_sq / preenc_width));
+        metrics->max_preenc_abs = std::max(metrics->max_preenc_abs, preenc_max_abs);
+        if (first_bad_preenc < 0 && preenc_cos < 0.9999f) {
+            first_bad_preenc = frame;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        std::vector<float> step_embd;
+        if (!clip_voicechat_stream_step(stream.get(), candidate_preenc, step_embd) ||
+            (int) step_embd.size() != n_embd) {
+            return false;
+        }
+        step_us.push_back(ggml_time_us() - t0);
+        if (stateful_embd_out != nullptr) {
+            std::memcpy(stateful_embd_out + (size_t) frame * n_embd,
+                        step_embd.data(), (size_t) n_embd * sizeof(float));
+        }
+
+        const float * reference = prefix_embd.data() + (size_t) frame * n_embd;
+        dot = ref_norm = got_norm = 0.0;
+        double embd_sq = 0.0;
+        float embd_max_abs = 0.0f;
+        for (int i = 0; i < n_embd; ++i) {
+            const double a = reference[i];
+            const double b = step_embd[i];
+            dot += a * b;
+            ref_norm += a * a;
+            got_norm += b * b;
+            const float diff = std::abs((float) (a - b));
+            embd_sq += (double) diff * diff;
+            embd_max_abs = std::max(embd_max_abs, diff);
+        }
+        const float cosine = (ref_norm > 0.0 && got_norm > 0.0)
+            ? (float) (dot / std::sqrt(ref_norm * got_norm)) : 0.0f;
+        metrics->min_cosine = std::min(metrics->min_cosine, cosine);
+        metrics->max_rmse = std::max(metrics->max_rmse,
+            (float) std::sqrt(embd_sq / n_embd));
+        metrics->max_abs = std::max(metrics->max_abs, embd_max_abs);
+        if (metrics->first_bad_frame < 0 && cosine < 0.9999f) {
+            metrics->first_bad_frame = frame;
+        }
+    }
+
+    std::sort(step_us.begin(), step_us.end());
+    int64_t total_us = 0;
+    for (int64_t value : step_us) {
+        total_us += value;
+    }
+    metrics->n_frames = n_frames;
+    metrics->state_bytes = clip_voicechat_stream_state_bytes(stream.get());
+    metrics->mean_step_us = total_us / n_frames;
+    metrics->p95_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.95) - 1)];
+    metrics->p99_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.99) - 1)];
+    LOG_INF("%s: frames=%d first_bad_preenc=%d preenc_min_cos=%.9f preenc_rmse=%.6g preenc_abs=%.6g\n",
+            __func__, n_frames, first_bad_preenc, metrics->min_preenc_cosine,
+            metrics->max_preenc_rmse, metrics->max_preenc_abs);
     return true;
 }
 
