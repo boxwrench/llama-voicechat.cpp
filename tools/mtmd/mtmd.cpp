@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1788,6 +1789,108 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
     }
+}
+
+bool mtmd_voicechat_d2_compare(mtmd_context * ctx, const mtmd_input_chunk * chunk,
+                               mtmd_voicechat_d2_metrics * metrics,
+                               float * stateful_embd_out) {
+    if (metrics == nullptr) {
+        return false;
+    }
+    *metrics = {};
+    metrics->first_bad_frame = -1;
+    metrics->min_cosine = 1.0f;
+
+    if (ctx == nullptr || chunk == nullptr || chunk->type != MTMD_INPUT_CHUNK_TYPE_AUDIO ||
+        ctx->ctx_a == nullptr || chunk->tokens_audio == nullptr ||
+        chunk->tokens_audio->is_placeholder() || clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
+        LOG_ERR("%s: requires a concrete VoiceChat audio chunk\n", __func__);
+        return false;
+    }
+
+    const int n_frames = (int) chunk->tokens_audio->n_tokens;
+    const int n_embd = clip_n_mmproj_embd(ctx->ctx_a);
+    std::vector<float> prefix_embd((size_t) std::max(0, n_frames) * std::max(0, n_embd));
+    std::vector<float> preenc;
+    if (!clip_image_batch_encode_with_preenc(ctx->ctx_a, ctx->n_threads,
+                                              &chunk->tokens_audio->batch_f32,
+                                              prefix_embd, preenc)) {
+        return false;
+    }
+
+    if (n_frames <= 0 || (int64_t) prefix_embd.size() != (int64_t) n_frames * n_embd ||
+        preenc.empty() || preenc.size() % (size_t) n_frames != 0) {
+        LOG_ERR("%s: unexpected VoiceChat oracle shapes: frames=%d embd=%d prefix=%zu preenc=%zu\n",
+                __func__, n_frames, n_embd, prefix_embd.size(), preenc.size());
+        return false;
+    }
+
+    std::unique_ptr<clip_voicechat_stream, decltype(&clip_voicechat_stream_free)> stream(
+        clip_voicechat_stream_init(ctx->ctx_a, ctx->n_threads), clip_voicechat_stream_free);
+    if (!stream) {
+        LOG_ERR("%s: failed to initialize stateful VoiceChat encoder prototype\n", __func__);
+        return false;
+    }
+
+    std::vector<int64_t> step_us;
+    step_us.reserve(n_frames);
+    const size_t preenc_width = preenc.size() / (size_t) n_frames;
+    std::vector<float> stateful;
+    for (int frame = 0; frame < n_frames; ++frame) {
+        const int64_t t0 = ggml_time_us();
+        if (!clip_voicechat_stream_step(stream.get(), preenc.data() + (size_t) frame * preenc_width,
+                                        stateful)) {
+            LOG_ERR("%s: stateful step failed at frame %d\n", __func__, frame);
+            return false;
+        }
+        step_us.push_back(ggml_time_us() - t0);
+
+        if ((int) stateful.size() != n_embd) {
+            LOG_ERR("%s: stateful output width %zu, expected %d\n", __func__, stateful.size(), n_embd);
+            return false;
+        }
+        if (stateful_embd_out != nullptr) {
+            std::memcpy(stateful_embd_out + (size_t) frame * n_embd,
+                        stateful.data(), (size_t) n_embd * sizeof(float));
+        }
+
+        const float * reference = prefix_embd.data() + (size_t) frame * n_embd;
+        double dot = 0.0;
+        double ref_norm = 0.0;
+        double got_norm = 0.0;
+        double sum_sq = 0.0;
+        float frame_max_abs = 0.0f;
+        for (int i = 0; i < n_embd; ++i) {
+            const double a = reference[i];
+            const double b = stateful[i];
+            dot += a * b;
+            ref_norm += a * a;
+            got_norm += b * b;
+            const float diff = std::abs((float) (a - b));
+            sum_sq += (double) diff * diff;
+            frame_max_abs = std::max(frame_max_abs, diff);
+        }
+        const float cosine = (ref_norm > 0.0 && got_norm > 0.0)
+            ? (float) (dot / std::sqrt(ref_norm * got_norm)) : 0.0f;
+        const float rmse = (float) std::sqrt(sum_sq / n_embd);
+        metrics->min_cosine = std::min(metrics->min_cosine, cosine);
+        metrics->max_rmse = std::max(metrics->max_rmse, rmse);
+        metrics->max_abs = std::max(metrics->max_abs, frame_max_abs);
+        if (metrics->first_bad_frame < 0 && cosine < 0.9999f) {
+            metrics->first_bad_frame = frame;
+        }
+    }
+
+    std::sort(step_us.begin(), step_us.end());
+    int64_t total_us = 0;
+    for (int64_t value : step_us) {
+        total_us += value;
+    }
+    metrics->n_frames = n_frames;
+    metrics->state_bytes = clip_voicechat_stream_state_bytes(stream.get());
+    metrics->mean_step_us = total_us / n_frames;
+    metrics->p95_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.95) - 1)];
+    return true;
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {

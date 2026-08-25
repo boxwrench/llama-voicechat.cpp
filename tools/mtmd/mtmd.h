@@ -300,6 +300,26 @@ DEPRECATED(MTMD_API int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tok
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
 
+// Research-only VoiceChat D2 oracle comparison.  This runs the existing
+// full-prefix encoder and compares it with the bounded-state encoder-stack
+// prototype fed the full graph's exact pre-encoder output.  It does not alter
+// the normal mtmd output buffer or production VoiceChat execution.
+struct mtmd_voicechat_d2_metrics {
+    int32_t n_frames;
+    int32_t first_bad_frame;
+    size_t  state_bytes;
+    float   min_cosine;
+    float   max_rmse;
+    float   max_abs;
+    int64_t mean_step_us;
+    int64_t p95_step_us;
+};
+
+MTMD_API bool mtmd_voicechat_d2_compare(mtmd_context * ctx,
+                                        const mtmd_input_chunk * chunk,
+                                        struct mtmd_voicechat_d2_metrics * metrics,
+                                        float * stateful_embd_out);
+
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)

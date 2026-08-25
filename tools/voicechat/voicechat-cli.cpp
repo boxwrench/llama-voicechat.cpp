@@ -1349,10 +1349,31 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
         return false;
     }
 
-    // copied out: the next encode overwrites mtmd's output buffer
     const int n_frames = (int) mtmd_input_chunk_get_n_tokens(audio_chunk);
+    std::vector<float> d2_stateful_embd;
+    if (getenv("VC_D2_STATE_TEST")) {
+        mtmd_voicechat_d2_metrics d2{};
+        if (getenv("VC_D2_STATEFUL_TIMELINE")) {
+            d2_stateful_embd.resize((size_t) n_frames * n_embd);
+        }
+        if (!mtmd_voicechat_d2_compare(ctx_mtmd.get(), audio_chunk, &d2,
+                                       d2_stateful_embd.empty() ? nullptr : d2_stateful_embd.data())) {
+            ev.error("D2 stateful perception comparison failed");
+            return false;
+        }
+        LOG_INF("voicechat-d2: frames=%d first_bad=%d state_bytes=%zu min_cos=%.9f "
+                "max_rmse=%.6g max_abs=%.6g mean_step_us=%" PRId64 " p95_step_us=%" PRId64 "\n",
+                d2.n_frames, d2.first_bad_frame, d2.state_bytes, d2.min_cosine,
+                d2.max_rmse, d2.max_abs, d2.mean_step_us, d2.p95_step_us);
+    }
+
+    // copied out: the next encode overwrites mtmd's output buffer
     aud.resize((size_t) n_frames * n_embd);
     memcpy(aud.data(), mtmd_get_output_embd(ctx_mtmd.get()), aud.size() * sizeof(float));
+    if (!d2_stateful_embd.empty()) {
+        aud.swap(d2_stateful_embd);
+        LOG_INF("voicechat-d2: using bounded-state embeddings for research timeline only\n");
+    }
 
     LOG_INF("perception: %d frames (%.2f s at 12.5 Hz) in %" PRId64 " ms\n",
             n_frames, n_frames / 12.5, ggml_time_ms() - t_enc);

@@ -869,6 +869,347 @@ ggml_tensor * clip_graph::build_stack(ggml_tensor * cur, int32_t stack_factor, i
     return cur;
 }
 
+// D2 research graph: one new pre-encoder frame plus bounded per-layer state.
+// This intentionally lives beside the normal graph rather than changing the
+// production mtmd path until parity and downstream fidelity are proven.
+static const clip_image_f32 & voicechat_stream_dummy_image() {
+    static const clip_image_f32 image = [] {
+        clip_image_f32 value;
+        value.set_size({1, 128}, false, true);
+        return value;
+    }();
+    return image;
+}
+
+struct clip_graph_voicechat_stream final : clip_graph {
+    const int n_hist;
+
+    clip_graph_voicechat_stream(clip_ctx * ctx, int n_hist)
+        : clip_graph(ctx, voicechat_stream_dummy_image()), n_hist(n_hist) {
+        GGML_ASSERT(ctx->model.proj_type == PROJECTOR_TYPE_VOICECHAT);
+        GGML_ASSERT(n_hist >= 0 && n_hist <= ctx->model.hparams.attn_window_size);
+    }
+
+    ggml_cgraph * build() override {
+        const auto & hparams = model.hparams;
+        const int n_state = hparams.n_embd;
+        const int n_head  = hparams.n_head;
+        const int d_head  = n_state / n_head;
+        const int n_time  = n_hist + 1;
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, 1);
+        ggml_set_name(cur, "vc_stream_preenc");
+        ggml_set_input(cur);
+
+        const int window_size = 2 * n_time - 1;
+        ggml_tensor * attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_time, 1);
+        ggml_set_name(attn_mask, "vc_stream_attn_mask");
+        ggml_set_input(attn_mask);
+
+        ggml_tensor * pos_freqs = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_state / 2);
+        ggml_set_name(pos_freqs, "vc_stream_pos_freqs");
+        ggml_set_input(pos_freqs);
+
+        ggml_tensor * rel_positions = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, window_size);
+        ggml_set_name(rel_positions, "vc_stream_rel_positions");
+        ggml_set_input(rel_positions);
+
+        ggml_tensor * freqs = ggml_repeat_4d(ctx0, pos_freqs, n_state / 2, window_size, 1, 1);
+        ggml_tensor * theta = ggml_mul(ctx0, freqs, rel_positions);
+        ggml_tensor * sin = ggml_reshape_3d(ctx0, ggml_sin(ctx0, theta), 1, n_state / 2, window_size);
+        ggml_tensor * cos = ggml_reshape_3d(ctx0, ggml_cos(ctx0, theta), 1, n_state / 2, window_size);
+        ggml_tensor * pos_emb = ggml_reshape_2d(ctx0,
+                ggml_cont(ctx0, ggml_concat(ctx0, sin, cos, 0)), n_state, window_size);
+        std::vector<ggml_tensor *> state_k;
+        std::vector<ggml_tensor *> state_v;
+        std::vector<ggml_tensor *> state_conv;
+        state_k.reserve(hparams.n_layer);
+        state_v.reserve(hparams.n_layer);
+        state_conv.reserve(hparams.n_layer);
+        for (int il = 0; il < hparams.n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            // macaron FFN 1
+            {
+                ggml_tensor * residual = cur;
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ff_norm_w), layer.ff_norm_b);
+                cur = build_ffn(cur, layer.ff_up_w, nullptr, nullptr, nullptr,
+                                layer.ff_down_w, nullptr, FFN_SILU, il);
+                cur = ggml_add(ctx0, residual, ggml_scale(ctx0, cur, 0.5f));
+            }
+
+            // Relative attention for one new query against at most 70 cached
+            // keys/values. The cache is ordered oldest to newest.
+            {
+                ggml_tensor * residual = cur;
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ln_1_w), layer.ln_1_b);
+
+                ggml_tensor * Q_raw = build_mm(layer.q_w, cur);
+                ggml_tensor * K_raw = build_mm(layer.k_w, cur);
+                ggml_tensor * V_raw = build_mm(layer.v_w, cur);
+
+                ggml_tensor * Q_cur = ggml_reshape_3d(ctx0, Q_raw, d_head, n_head, 1);
+                ggml_tensor * K_cur = ggml_reshape_3d(ctx0, K_raw, d_head, n_head, 1);
+                ggml_tensor * V_cur = ggml_reshape_3d(ctx0, V_raw, d_head, n_head, 1);
+                ggml_tensor * K_state = ggml_cont(ctx0, K_cur);
+                ggml_tensor * V_state = ggml_cont(ctx0, V_cur);
+                ggml_set_name(K_state, ("vc_stream_l" + std::to_string(il) + "_k_internal").c_str());
+                ggml_set_name(V_state, ("vc_stream_l" + std::to_string(il) + "_v_internal").c_str());
+                state_k.push_back(K_state);
+                state_v.push_back(V_state);
+
+                ggml_tensor * K_all = K_cur;
+                ggml_tensor * V_all = V_cur;
+                if (n_hist > 0) {
+                    ggml_tensor * K_hist = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_head, n_head, n_hist);
+                    ggml_set_name(K_hist, ("vc_stream_l" + std::to_string(il) + "_k_hist").c_str());
+                    ggml_set_input(K_hist);
+                    ggml_tensor * V_hist = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_head, n_head, n_hist);
+                    ggml_set_name(V_hist, ("vc_stream_l" + std::to_string(il) + "_v_hist").c_str());
+                    ggml_set_input(V_hist);
+                    K_all = ggml_concat(ctx0, K_hist, K_cur, 2);
+                    V_all = ggml_concat(ctx0, V_hist, V_cur, 2);
+                    // Keep the cached frame axis contiguous before the same
+                    // permute/matmul sequence used by the full-prefix graph.
+                    K_all = ggml_cont(ctx0, K_all);
+                    V_all = ggml_cont(ctx0, V_all);
+                }
+
+                Q_cur = ggml_cont(ctx0, Q_cur);
+                ggml_tensor * Q_u = ggml_add(ctx0, Q_cur, layer.pos_bias_u);
+                ggml_tensor * K_prep = ggml_permute(ctx0, K_all, 0, 2, 1, 3);
+                ggml_tensor * Q_prep = ggml_permute(ctx0, Q_u,   0, 2, 1, 3);
+                ggml_tensor * content_scores = ggml_mul_mat(ctx0, K_prep, Q_prep);
+
+                ggml_tensor * Q_v = ggml_add(ctx0, Q_cur, layer.pos_bias_v);
+                Q_v = ggml_cont(ctx0, ggml_permute(ctx0, Q_v, 0, 2, 1, 3));
+                ggml_tensor * pos = build_mm(layer.linear_pos_w, pos_emb);
+                pos = ggml_reshape_3d(ctx0, pos, d_head, n_head, window_size);
+                pos = ggml_cont(ctx0, ggml_permute(ctx0, pos, 0, 2, 1, 3));
+                ggml_tensor * rel_pos_scores = ggml_mul_mat(ctx0, pos, Q_v);
+
+                // For a single newest query, the full Transformer-XL rel-shift
+                // reduces to the first n_hist+1 raw relative positions: the
+                // input positions are [n_hist .. -n_hist], while K_all is
+                // ordered oldest-to-newest.  Keep this as a direct view rather
+                // than applying the full-sequence reshape/roll; that transform
+                // requires at least two query rows and its view is invalid for
+                // the one-row streaming graph.
+                rel_pos_scores = ggml_view_3d(ctx0, rel_pos_scores,
+                        n_hist + 1, 1, n_head,
+                        rel_pos_scores->nb[0], rel_pos_scores->nb[1], 0);
+                rel_pos_scores = ggml_cont(ctx0, rel_pos_scores);
+
+                ggml_tensor * scores = ggml_add(ctx0, content_scores, rel_pos_scores);
+                scores = ggml_scale(ctx0, scores, 1.0f / std::sqrt((float) d_head));
+                scores = ggml_add(ctx0, scores, attn_mask);
+                ggml_tensor * probs = ggml_soft_max(ctx0, scores);
+
+                V_all = ggml_cont(ctx0, ggml_permute(ctx0, V_all, 1, 2, 0, 3));
+                cur = ggml_mul_mat(ctx0, probs, V_all);
+                cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
+                cur = ggml_cont_2d(ctx0, cur, n_state, 1);
+                cur = build_mm(layer.o_w, cur);
+                cur = ggml_add(ctx0, residual, cur);
+            }
+
+            // causal convolution: the cache supplies the eight preceding GLU
+            // vectors, so ssm_conv sees exactly kernel-1 + one new frame.
+            {
+                ggml_tensor * residual = cur;
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.norm_conv_w), layer.norm_conv_b);
+                cur = build_mm(layer.conv_pw1_w, cur);
+                const int64_t d = cur->ne[0] / 2;
+                ggml_tensor * signal = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], 0);
+                ggml_tensor * gate   = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], d * cur->nb[0]);
+                ggml_tensor * glu = ggml_mul(ctx0, signal, ggml_sigmoid(ctx0, gate));
+                ggml_tensor * conv_state = ggml_cont(ctx0, glu);
+                ggml_set_name(conv_state, ("vc_stream_l" + std::to_string(il) + "_conv_internal").c_str());
+                state_conv.push_back(conv_state);
+
+                ggml_tensor * conv_hist = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, hparams.audio_conv_kernel_size - 1);
+                ggml_set_name(conv_hist, ("vc_stream_l" + std::to_string(il) + "_conv_hist").c_str());
+                ggml_set_input(conv_hist);
+                ggml_tensor * conv_seq = ggml_concat(ctx0, conv_hist, conv_state, 1);
+                conv_seq = ggml_cont(ctx0, ggml_transpose(ctx0, conv_seq));
+                cur = ggml_ssm_conv(ctx0, conv_seq, layer.conv_dw_w);
+                ggml_set_name(cur, ("vc_stream_l" + std::to_string(il) + "_dw").c_str());
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.conv_norm_w), layer.conv_norm_b);
+                cur = ggml_silu(ctx0, cur);
+                cur = build_mm(layer.conv_pw2_w, cur);
+                cur = ggml_add(ctx0, residual, cur);
+            }
+
+            // macaron FFN 2 and post-layer norm
+            {
+                ggml_tensor * residual = cur;
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ff_norm_1_w), layer.ff_norm_1_b);
+                cur = build_ffn(cur, layer.ff_up_1_w, nullptr, nullptr, nullptr,
+                                layer.ff_down_1_w, nullptr, FFN_SILU, il);
+                cur = ggml_add(ctx0, residual, ggml_scale(ctx0, cur, 0.5f));
+            }
+            cur = ggml_norm(ctx0, cur, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ln_2_w), layer.ln_2_b);
+        }
+
+        cur = build_mm(model.mm_0_w, cur);
+        cur = ggml_add(ctx0, cur, model.mm_0_b);
+        ggml_set_name(cur, "vc_stream_projected");
+        ggml_build_forward_expand(gf, cur);
+        for (size_t il = 0; il < state_k.size(); ++il) {
+            ggml_tensor * output = ggml_cont(ctx0, state_k[il]);
+            ggml_set_name(output, ("vc_stream_l" + std::to_string(il) + "_k").c_str());
+            ggml_build_forward_expand(gf, output);
+        }
+        for (size_t il = 0; il < state_v.size(); ++il) {
+            ggml_tensor * output = ggml_cont(ctx0, state_v[il]);
+            ggml_set_name(output, ("vc_stream_l" + std::to_string(il) + "_v").c_str());
+            ggml_build_forward_expand(gf, output);
+        }
+        for (size_t il = 0; il < state_conv.size(); ++il) {
+            ggml_tensor * output = ggml_cont(ctx0, state_conv[il]);
+            ggml_set_name(output, ("vc_stream_l" + std::to_string(il) + "_conv").c_str());
+            ggml_build_forward_expand(gf, output);
+        }
+        return gf;
+    }
+};
+
+struct clip_voicechat_stream {
+    clip_ctx * ctx = nullptr;
+    int n_threads = 1;
+    int n_state = 0;
+    int n_head = 0;
+    int d_head = 0;
+    int n_layer = 0;
+    int max_history = 0;
+    std::vector<std::vector<float>> k_hist;
+    std::vector<std::vector<float>> v_hist;
+    std::vector<std::vector<float>> conv_hist;
+};
+
+clip_voicechat_stream * clip_voicechat_stream_init(clip_ctx * ctx, int n_threads) {
+    if (ctx == nullptr || ctx->model.proj_type != PROJECTOR_TYPE_VOICECHAT) {
+        return nullptr;
+    }
+    auto * stream = new clip_voicechat_stream;
+    stream->ctx = ctx;
+    stream->n_threads = n_threads;
+    stream->n_state = ctx->model.hparams.n_embd;
+    stream->n_head = ctx->model.hparams.n_head;
+    stream->d_head = stream->n_state / stream->n_head;
+    stream->n_layer = ctx->model.hparams.n_layer;
+    stream->max_history = ctx->model.hparams.attn_window_size;
+    stream->k_hist.resize(stream->n_layer);
+    stream->v_hist.resize(stream->n_layer);
+    stream->conv_hist.resize(stream->n_layer, std::vector<float>(stream->n_state * 8, 0.0f));
+    return stream;
+}
+
+void clip_voicechat_stream_free(clip_voicechat_stream * stream) {
+    delete stream;
+}
+
+size_t clip_voicechat_stream_state_bytes(const clip_voicechat_stream * stream) {
+    if (stream == nullptr) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (int il = 0; il < stream->n_layer; ++il) {
+        bytes += (stream->k_hist[il].size() + stream->v_hist[il].size() + stream->conv_hist[il].size()) * sizeof(float);
+    }
+    return bytes;
+}
+
+bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * preenc,
+                                std::vector<float> & out_embd) {
+    if (stream == nullptr || preenc == nullptr) {
+        return false;
+    }
+    int n_hist = stream->k_hist.empty() ? 0 : (int) stream->k_hist[0].size() / stream->n_state;
+    clip_graph_voicechat_stream builder(stream->ctx, n_hist);
+    ggml_cgraph * gf = builder.build();
+    ggml_backend_sched_reset(stream->ctx->sched.get());
+    ggml_backend_sched_alloc_graph(stream->ctx->sched.get(), gf);
+
+    auto set_input = [&](const std::string & name, const float * data, size_t n) {
+        ggml_tensor * tensor = ggml_graph_get_tensor(gf, name.c_str());
+        if (tensor == nullptr || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) || ggml_nelements(tensor) != (int64_t) n) {
+            throw std::runtime_error("invalid D2 state input: " + name);
+        }
+        ggml_backend_tensor_set(tensor, data, 0, n * sizeof(float));
+    };
+
+    set_input("vc_stream_preenc", preenc, stream->n_state);
+    std::vector<float> mask((size_t) n_hist + 1, 0.0f);
+    set_input("vc_stream_attn_mask", mask.data(), mask.size());
+    std::vector<float> freqs(stream->n_state / 2);
+    const float log_10000 = logf(10000.0f);
+    for (int k = 0; k < stream->n_state / 2; ++k) {
+        freqs[k] = expf(-(float(k * 2) * log_10000 / float(stream->n_state)));
+    }
+    set_input("vc_stream_pos_freqs", freqs.data(), freqs.size());
+    std::vector<float> rel_pos((size_t) 2 * (n_hist + 1) - 1);
+    for (size_t i = 0; i < rel_pos.size(); ++i) {
+        rel_pos[i] = float(n_hist - (int) i);
+    }
+    set_input("vc_stream_rel_positions", rel_pos.data(), rel_pos.size());
+
+    const size_t kv_frame = (size_t) stream->n_state;
+    const size_t conv_frame = (size_t) stream->n_state;
+    for (int il = 0; il < stream->n_layer; ++il) {
+        if (n_hist > 0) {
+            set_input("vc_stream_l" + std::to_string(il) + "_k_hist", stream->k_hist[il].data(), stream->k_hist[il].size());
+            set_input("vc_stream_l" + std::to_string(il) + "_v_hist", stream->v_hist[il].data(), stream->v_hist[il].size());
+        }
+        set_input("vc_stream_l" + std::to_string(il) + "_conv_hist", stream->conv_hist[il].data(), stream->conv_hist[il].size());
+    }
+
+    if (ggml_backend_sched_graph_compute(stream->ctx->sched.get(), gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    auto get_output = [&](const std::string & name, std::vector<float> & dst) {
+        ggml_tensor * tensor = ggml_graph_get_tensor(gf, name.c_str());
+        if (tensor == nullptr) {
+            throw std::runtime_error("missing D2 state output: " + name);
+        }
+        dst.resize(ggml_nelements(tensor));
+        ggml_backend_tensor_get(tensor, dst.data(), 0, ggml_nbytes(tensor));
+    };
+
+    get_output("vc_stream_projected", out_embd);
+    std::vector<std::vector<float>> next_k(stream->n_layer), next_v(stream->n_layer), next_conv(stream->n_layer);
+    for (int il = 0; il < stream->n_layer; ++il) {
+        get_output("vc_stream_l" + std::to_string(il) + "_k", next_k[il]);
+        get_output("vc_stream_l" + std::to_string(il) + "_v", next_v[il]);
+        get_output("vc_stream_l" + std::to_string(il) + "_conv", next_conv[il]);
+    }
+
+    for (int il = 0; il < stream->n_layer; ++il) {
+        auto & kh = stream->k_hist[il];
+        auto & vh = stream->v_hist[il];
+        if ((int) kh.size() >= stream->max_history * (int) kv_frame) {
+            kh.erase(kh.begin(), kh.begin() + kv_frame);
+            vh.erase(vh.begin(), vh.begin() + kv_frame);
+        }
+        kh.insert(kh.end(), next_k[il].begin(), next_k[il].end());
+        vh.insert(vh.end(), next_v[il].begin(), next_v[il].end());
+
+        auto & ch = stream->conv_hist[il];
+        std::memmove(ch.data(), ch.data() + conv_frame,
+                     (ch.size() - conv_frame) * sizeof(float));
+        std::memcpy(ch.data() + ch.size() - conv_frame, next_conv[il].data(),
+                    std::min(conv_frame, next_conv[il].size()) * sizeof(float));
+    }
+    return true;
+}
+
 // aka pixel_shuffle / pixel_unshuffle / patch_merger (Kimi-VL)
 // support dynamic resolution
 ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale_factor) {
@@ -4316,6 +4657,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     params.imgs = imgs_c_ptr;
     params.n_threads = n_threads;
     params.out_embd = &out_batch_embd;
+    return clip_encode(ctx, &params);
+}
+
+bool clip_image_batch_encode_with_preenc(clip_ctx * ctx, int n_threads, const clip_image_f32_batch * imgs_c_ptr,
+                                         std::vector<float> & out_batch_embd, std::vector<float> & out_preenc) {
+    clip_encode_params params;
+    params.imgs = imgs_c_ptr;
+    params.n_threads = n_threads;
+    params.out_embd = &out_batch_embd;
+    params.out_voicechat_preenc = &out_preenc;
 
     return clip_encode(ctx, &params);
 }
@@ -4351,7 +4702,22 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+    auto graph_builder = clip_get_graph_builder(ctx, imgs, params);
+    ggml_cgraph * gf = graph_builder->build();
+
+    // Research callers need intermediate VoiceChat tensors to remain live
+    // through compute; otherwise the allocator may reuse their buffers after
+    // the final projection is built.
+    if (ctx->model.proj_type == PROJECTOR_TYPE_VOICECHAT) {
+        if (params->out_voicechat_preenc != nullptr) {
+            ggml_tensor * preenc = ggml_graph_get_tensor(gf, "pre_enc_out");
+            if (preenc != nullptr) {
+                ggml_tensor * keep = ggml_cont(graph_builder->ctx0, preenc);
+                ggml_set_name(keep, "d2_keep_preenc");
+                ggml_build_forward_expand(gf, keep);
+            }
+        }
+    }
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
 
     // set inputs
@@ -5639,8 +6005,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         return false;
     }
 
+    if (params->out_voicechat_preenc != nullptr) {
+        auto & out_preenc = *params->out_voicechat_preenc;
+        if (model.proj_type != PROJECTOR_TYPE_VOICECHAT) {
+            out_preenc.clear();
+        } else {
+            ggml_tensor * preenc = ggml_graph_get_tensor(gf, "d2_keep_preenc");
+            if (preenc == nullptr) {
+                LOG_ERR("%s: VoiceChat graph has no pre_enc_out tensor\n", __func__);
+                return false;
+            }
+            out_preenc.resize(ggml_nelements(preenc));
+            ggml_backend_tensor_get(preenc, out_preenc.data(), 0, ggml_nbytes(preenc));
+        }
+    }
+
     // the last node is the embedding tensor, code2wav has no out_embd
-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+    ggml_tensor * embeddings = nullptr;
+    if (params->out_embd) {
+        embeddings = params->out_voicechat_preenc != nullptr &&
+                     model.proj_type == PROJECTOR_TYPE_VOICECHAT
+            ? ggml_graph_get_tensor(gf, "projected")
+            : ggml_graph_node(gf, -1);
+    }
 
     if (embeddings != nullptr) {
         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)

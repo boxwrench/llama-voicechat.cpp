@@ -86,6 +86,20 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
 
+// D2 research hooks. These expose the VoiceChat encoder's pre-encoder output
+// and a stateful encoder prototype without changing the normal mtmd path.
+bool clip_image_batch_encode_with_preenc(struct clip_ctx * ctx, int n_threads,
+        const struct clip_image_f32_batch * imgs,
+        std::vector<float> & out_batch_embd,
+        std::vector<float> & out_preenc);
+
+struct clip_voicechat_stream;
+struct clip_voicechat_stream * clip_voicechat_stream_init(struct clip_ctx * ctx, int n_threads);
+void clip_voicechat_stream_free(struct clip_voicechat_stream * stream);
+bool clip_voicechat_stream_step(struct clip_voicechat_stream * stream,
+        const float * preenc, std::vector<float> & out_embd);
+size_t clip_voicechat_stream_state_bytes(const struct clip_voicechat_stream * stream);
+
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
@@ -95,6 +109,7 @@ struct clip_encode_params {
     int n_threads = 1;
     const clip_image_f32_batch * imgs = nullptr;
     std::vector<float> * out_embd = nullptr;
+    std::vector<float> * out_voicechat_preenc = nullptr;
 
     // for audio gen, imgs has exactly one entry: hidden state from backbone (GEN_CODE) or unused (GEN_WAV)
     clip_gen_process_type gen_process = CLIP_GEN_PROCESS_GEN_UNKNOWN;
