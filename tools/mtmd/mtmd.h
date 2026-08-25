@@ -313,6 +313,7 @@ struct mtmd_voicechat_d2_metrics {
     float   max_abs;
     int64_t mean_step_us;
     int64_t p95_step_us;
+    int64_t p99_step_us;
 };
 
 MTMD_API bool mtmd_voicechat_d2_compare(mtmd_context * ctx,

@@ -1362,9 +1362,9 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
             return false;
         }
         LOG_INF("voicechat-d2: frames=%d first_bad=%d state_bytes=%zu min_cos=%.9f "
-                "max_rmse=%.6g max_abs=%.6g mean_step_us=%" PRId64 " p95_step_us=%" PRId64 "\n",
+                "max_rmse=%.6g max_abs=%.6g mean_step_us=%" PRId64 " p95_step_us=%" PRId64 " p99_step_us=%" PRId64 "\n",
                 d2.n_frames, d2.first_bad_frame, d2.state_bytes, d2.min_cosine,
-                d2.max_rmse, d2.max_abs, d2.mean_step_us, d2.p95_step_us);
+                d2.max_rmse, d2.max_abs, d2.mean_step_us, d2.p95_step_us, d2.p99_step_us);
     }
 
     // copied out: the next encode overwrites mtmd's output buffer

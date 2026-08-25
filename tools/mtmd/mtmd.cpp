@@ -1890,6 +1890,7 @@ bool mtmd_voicechat_d2_compare(mtmd_context * ctx, const mtmd_input_chunk * chun
     metrics->state_bytes = clip_voicechat_stream_state_bytes(stream.get());
     metrics->mean_step_us = total_us / n_frames;
     metrics->p95_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.95) - 1)];
+    metrics->p99_step_us = step_us[(size_t) std::min<int>(n_frames - 1, (int) std::ceil(n_frames * 0.99) - 1)];
     return true;
 }
 
