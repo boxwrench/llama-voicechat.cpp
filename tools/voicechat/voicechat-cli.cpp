@@ -498,6 +498,137 @@ struct vc_session {
     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
 };
 
+static bool write_pcm_wav(const char * path, const std::vector<int16_t> & pcm, int sample_rate) {
+    if (!path || !*path || pcm.empty() || sample_rate <= 0) {
+        return false;
+    }
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        LOG_ERR("voicechat: cannot write %s\n", path);
+        return false;
+    }
+    const uint32_t sr       = (uint32_t) sample_rate;
+    const uint32_t data_sz  = (uint32_t) (pcm.size() * sizeof(int16_t));
+    const uint32_t byte_rate = sr * 2;
+    const uint32_t riff_sz  = 36 + data_sz;
+    const uint32_t fmt_sz   = 16;
+    const uint16_t align    = 2;
+    const uint16_t bits     = 16;
+    const uint16_t fmt      = 1;
+    const uint16_t channels = 1;
+    fwrite("RIFF", 1, 4, f); fwrite(&riff_sz, 4, 1, f); fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f); fwrite(&fmt_sz, 4, 1, f); fwrite(&fmt, 2, 1, f);
+    fwrite(&channels, 2, 1, f); fwrite(&sr, 4, 1, f); fwrite(&byte_rate, 4, 1, f);
+    fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data_sz, 4, 1, f);
+    const bool ok = fwrite(pcm.data(), sizeof(int16_t), pcm.size(), f) == pcm.size();
+    fclose(f);
+    if (!ok) {
+        LOG_ERR("voicechat: short write for %s\n", path);
+    }
+    return ok;
+}
+
+// M3.1 is deliberately a post-turn path. The model and native TTS generator
+// have already completed; this function only decodes the settled frame store
+// and sends the resulting PCM to the runtime-owned aplay process. It must not
+// be called from tts_feed() or from the 80 ms VoiceChat frame loop.
+static bool stream_tts_after_turn(vc_session & sess, int first, int turn,
+                                  bool playback, const char * dump_path) {
+    const int n_have = voicechat_tts_n_frames(sess.tts);
+    first = std::min(std::max(first, 0), n_have);
+
+    FILE * pipe = nullptr;
+    if (playback) {
+        const std::string cmd = "aplay -q -t raw -f S16_LE -c 1 -r " +
+                                std::to_string(voicechat_tts_sample_rate(sess.tts));
+        pipe = popen(cmd.c_str(), "w");
+        if (!pipe) {
+            LOG_ERR("voicechat: cannot start aplay for streaming playback\n");
+            return false;
+        }
+        setvbuf(pipe, nullptr, _IONBF, 0);
+    }
+
+    const int64_t t0 = ggml_time_ms();
+    voicechat_tts_stream_reset(sess.tts, first);
+    vc_stream_timing timing;
+    std::vector<int16_t> assembled;
+    bool playback_begun = false;
+    bool ok = true;
+
+    auto send = [&](const std::vector<int16_t> & chunk) {
+        if (chunk.empty()) {
+            return true;
+        }
+        assembled.insert(assembled.end(), chunk.begin(), chunk.end());
+        if (!pipe) {
+            return true;
+        }
+        if (fwrite(chunk.data(), sizeof(int16_t), chunk.size(), pipe) != chunk.size() ||
+            fflush(pipe) != 0) {
+            LOG_ERR("voicechat: streaming PCM write failed\n");
+            return false;
+        }
+        if (!playback_begun) {
+            // The unbuffered pipe has received the first real PCM at this
+            // point. This is intentionally earlier than the end-of-turn audio
+            // event and is the metric consumed by the PTT clients.
+            sess.ev.emit(json{{"kind", "playback_begin"}, {"turn", turn}});
+            playback_begun = true;
+        }
+        return true;
+    };
+
+    // Drain every frame currently present. In particular, do not flush after
+    // only the last frame observed by the generation loop: the final appended
+    // frame can still be pending and dropping it truncates about 80 ms.
+    while (true) {
+        const std::vector<int16_t> chunk = voicechat_tts_stream_step(sess.tts, &timing, 8);
+        if (chunk.empty()) {
+            break;
+        }
+        if (!send(chunk)) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) {
+        if (!send(voicechat_tts_stream_flush(sess.tts))) {
+            ok = false;
+        }
+    }
+
+    if (dump_path && *dump_path && !write_pcm_wav(dump_path, assembled,
+                                                   voicechat_tts_sample_rate(sess.tts))) {
+        ok = false;
+    }
+
+    if (pipe) {
+        const int status = pclose(pipe);
+        if (status != 0) {
+            LOG_ERR("voicechat: aplay exited with status %d\n", status);
+            ok = false;
+        }
+    }
+
+    LOG_INF("voicechat: post-turn stream first=%d frames=%d pcm=%zu samples "
+            "codec=%" PRId64 " us istft=%" PRId64 " us total=%" PRId64 " ms\n",
+            first, n_have - first, assembled.size(), timing.codec_us, timing.istft_us,
+            ggml_time_ms() - t0);
+
+    if (ok && playback) {
+        // Keep the legacy end-of-turn event as a drain/settle notification, but
+        // do not attach a WAV path: the runtime-owned aplay process already
+        // played the stream and the client must not play it a second time.
+        sess.ev.emit(json{{"kind", "audio"}, {"turn", turn},
+                          {"frames", n_have - first},
+                          {"seconds", (double) assembled.size() /
+                                      voicechat_tts_sample_rate(sess.tts)}});
+    }
+    return ok;
+}
+
 bool vc_session::init(common_params & params, const std::string & tts_gguf, const std::string & tts_dev) {
     llama_init = common_init_from_params(params);
     model = llama_init->model();
@@ -1157,6 +1288,25 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
                 n_drain, n_drain / 12.5, ggml_time_ms() - t_drain);
     }
 
+    // Optional M3.1 recovery path: all text and native TTS generation above
+    // have completed, so codec/ISTFT work cannot delay the live 80 ms loop.
+    // The complete-WAV path below remains byte-for-byte untouched when neither
+    // environment variable is present.
+    bool streamed = false;
+    const bool stream_playback = getenv("VC_TTS_STREAM_PLAYBACK") != nullptr;
+    const char * stream_out = getenv("VC_TTS_STREAM_OUT");
+    if (tts && (stream_playback || (stream_out && *stream_out))) {
+        int first = tts_first;
+        if (tts_first_tok > tts_first) {
+            first = std::max(tts_first, tts_first_tok - 6);
+        }
+        if (!stream_tts_after_turn(*this, first, n_turns, stream_playback, stream_out)) {
+            ev.error("post-turn streaming playback failed");
+            return false;
+        }
+        streamed = true;
+    }
+
     result = json{
         {"kind",    "turn_end"},
         {"turn",    n_turns},
@@ -1172,7 +1322,7 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
     }
 
     // ----------------------------------------------------------------- wav
-    if (tts && !out_wav.empty()) {
+    if (tts && !out_wav.empty() && !streamed) {
         const int64_t t_wav = ggml_time_ms();
         const int n_have = voicechat_tts_n_frames(tts);
         // With the barge-in guard the agent sits silent through the whole
@@ -1379,6 +1529,11 @@ static bool vc_say(vc_session & sess, const std::string & text, int pace, const 
         if (sess.tts_q.empty() && i >= sess.n_drain_min && n_silent >= sess.n_drain_quiet) {
             break;
         }
+    }
+    const bool stream_playback = getenv("VC_TTS_STREAM_PLAYBACK") != nullptr;
+    const char * stream_out = getenv("VC_TTS_STREAM_OUT");
+    if (stream_playback || (stream_out && *stream_out)) {
+        return stream_tts_after_turn(sess, 0, 0, stream_playback, stream_out);
     }
     return voicechat_tts_write_wav(sess.tts, out.c_str(), 0, -1);
 }

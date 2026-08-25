@@ -24,6 +24,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "log.h"
+#include "mtmd-audio.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -272,6 +274,14 @@ struct voicechat_tts {
     std::vector<int> ks;                      // per-iteration unmask counts
     std::mt19937 rng;
     std::vector<float> vbuf;
+
+    // Post-turn streaming decoder state. This is deliberately separate from
+    // the TTS generation state: the main 80 ms loop continues to append full
+    // codec frames, and this state is consumed only after text generation and
+    // native speech drain have settled.
+    std::unique_ptr<mtmd_audio_streaming_istft> stream_istft;
+    int  stream_next   = 0;
+    bool stream_active = false;
 
     bool load(const char * fname, const char * device, int n_threads, int n_frames_max, uint32_t seed);
     bool init_backend(const char * device, int n_threads);
@@ -1426,6 +1436,120 @@ bool voicechat_tts_write_wav(voicechat_tts * tts, const char * path, int n_skip,
 
     LOG_INF("voicechat-tts: wrote %s, %d frames, %.2f s\n", path, T, (float) out_len / sr);
     return true;
+}
+
+// Convert one codec spectrogram row (log magnitude followed by phase) into
+// the interleaved real/imaginary spectrum consumed by the existing streaming
+// ISTFT. This is the same transform as voicechat_tts_write_wav(); the
+// streaming ISTFT intentionally does not apply write_wav's per-sample clamp.
+static void codec_spec_to_complex(const voicechat_tts * tts, const float * spec,
+                                  std::vector<float> & complex) {
+    const int n_bins = tts->n_fft / 2 + 1;
+    complex.resize((size_t) n_bins * 2);
+    const float logm = logf(100.0f);
+    for (int b = 0; b < n_bins; ++b) {
+        const float mag = 100.0f * expf(-softplus(logm - spec[b]));
+        const float ph  = spec[n_bins + b];
+        complex[(size_t) b * 2 + 0] = mag * cosf(ph);
+        complex[(size_t) b * 2 + 1] = (b == 0 || b == n_bins - 1) ? 0.0f : mag * sinf(ph);
+    }
+}
+
+static void append_pcm16(std::vector<int16_t> & dst, const std::vector<float> & src) {
+    dst.reserve(dst.size() + src.size());
+    for (float s : src) {
+        s = std::min(std::max(s, -1.0f), 1.0f);
+        dst.push_back((int16_t) lrintf(s * 32767.0f));
+    }
+}
+
+void voicechat_tts_stream_reset(voicechat_tts * tts, int first) {
+    if (!tts) {
+        return;
+    }
+    if (!tts->stream_istft) {
+        tts->stream_istft = std::make_unique<mtmd_audio_streaming_istft>(tts->n_fft, tts->hop);
+    }
+    tts->stream_istft->reset();
+    tts->stream_next   = std::min(std::max(first, 0), (int) tts->frames.size());
+    tts->stream_active = true;
+}
+
+std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
+                                               vc_stream_timing * timing,
+                                               int max_frames) {
+    std::vector<int16_t> pcm;
+    if (!tts || !tts->stream_active || max_frames <= 0) {
+        return pcm;
+    }
+
+    const int n_have = (int) tts->frames.size();
+    if (tts->stream_next >= n_have) {
+        return pcm;
+    }
+
+    const int start = tts->stream_next;
+    const int count = std::min(max_frames, n_have - start);
+    const int lead  = std::min(start, 8);
+
+    std::vector<float> lat((size_t) (lead + count) * tts->n_latent);
+    for (int i = 0; i < lead + count; ++i) {
+        std::vector<int32_t> code = tts->frames[start - lead + i];
+        for (int q = 0; q < tts->n_quant; ++q) {
+            if (code[q] >= tts->n_codebook) {
+                code[q] = tts->silence[q];
+            }
+        }
+        tts->depthsum(code.data(), lat.data() + (size_t) i * tts->n_latent);
+    }
+
+    const int64_t t_codec = ggml_time_us();
+    const std::vector<float> spec = codec_decode(tts, lat, lead + count);
+    if (timing) {
+        timing->codec_us += ggml_time_us() - t_codec;
+    }
+
+    int up_total = 1;
+    for (int r : tts->dec_rates) {
+        up_total *= r;
+    }
+    const int n_spec = tts->n_fft + 2;
+    const size_t expected = (size_t) (lead + count) * up_total * n_spec;
+    if (spec.size() != expected) {
+        LOG_ERR("voicechat-tts: streaming codec returned %zu values, expected %zu\n",
+                spec.size(), expected);
+        return pcm;
+    }
+
+    std::vector<float> complex;
+    const int64_t t_istft = ggml_time_us();
+    for (int i = lead * up_total; i < (lead + count) * up_total; ++i) {
+        codec_spec_to_complex(tts, spec.data() + (size_t) i * n_spec, complex);
+        append_pcm16(pcm, tts->stream_istft->process_frame(complex.data()));
+    }
+    if (timing) {
+        timing->istft_us += ggml_time_us() - t_istft;
+    }
+
+    // Advance only after all rows for this causal range have been consumed.
+    // At turn end callers must keep invoking this until it returns empty before
+    // calling stream_flush(), otherwise the final ~80 ms frame is lost.
+    tts->stream_next = start + count;
+    return pcm;
+}
+
+std::vector<int16_t> voicechat_tts_stream_flush(voicechat_tts * tts) {
+    std::vector<int16_t> pcm;
+    if (!tts || !tts->stream_active || !tts->stream_istft) {
+        return pcm;
+    }
+    append_pcm16(pcm, tts->stream_istft->flush());
+    tts->stream_active = false;
+    return pcm;
+}
+
+int voicechat_tts_sample_rate(const voicechat_tts * tts) {
+    return tts ? tts->sample_rate : 0;
 }
 
 void voicechat_tts_free(voicechat_tts * tts) {

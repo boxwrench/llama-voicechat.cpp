@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 struct voicechat_tts;
 
@@ -37,5 +38,21 @@ int voicechat_tts_n_frames(const voicechat_tts * tts);
 // `first` are decoded as causal context and thrown away, so a turn's wav does
 // not start on a codec transient.
 bool voicechat_tts_write_wav(voicechat_tts * tts, const char * path, int first = 0, int count = -1);
+
+// Post-turn streaming playback support. These functions decode only frames
+// already present in the TTS frame store; callers must not invoke them from
+// the 80 ms generation loop. The stream is causal and may be started at a
+// mid-session frame with a short decoder run-up that is discarded.
+struct vc_stream_timing {
+    int64_t codec_us = 0;
+    int64_t istft_us = 0;
+};
+
+void voicechat_tts_stream_reset(voicechat_tts * tts, int first);
+std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
+                                               vc_stream_timing * timing = nullptr,
+                                               int max_frames = 8);
+std::vector<int16_t> voicechat_tts_stream_flush(voicechat_tts * tts);
+int voicechat_tts_sample_rate(const voicechat_tts * tts);
 
 void voicechat_tts_free(voicechat_tts * tts);
