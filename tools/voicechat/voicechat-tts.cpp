@@ -33,6 +33,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
@@ -115,6 +116,7 @@ struct vc_sched {
     std::vector<uint8_t> meta;           // graph + tensor structs only, no data
     ggml_context * ctx = nullptr;
     ggml_cgraph  * gf  = nullptr;
+    bool owns_backends = true;
 
     struct upload {
         ggml_tensor * t;
@@ -167,8 +169,54 @@ struct vc_sched {
 
     void free_all() {
         if (sched)    { ggml_backend_sched_free(sched); sched = nullptr; }
-        if (back_cpu) { ggml_backend_free(back_cpu); back_cpu = nullptr; }
-        if (backend)  { ggml_backend_free(backend); backend = nullptr; }
+        if (owns_backends) {
+            if (back_cpu) { ggml_backend_free(back_cpu); back_cpu = nullptr; }
+            if (backend)  { ggml_backend_free(backend); backend = nullptr; }
+        } else {
+            back_cpu = nullptr;
+            backend = nullptr;
+        }
+    }
+
+    // A renderer worker may use the same read-only weight buffers and device,
+    // but it needs separate backend instances as well as separate scheduler /
+    // context state. Some backends are not safe for concurrent alloc/compute
+    // through one handle. The worker owns these handles; the primary scheduler
+    // remains responsible for the weight buffers.
+    bool init_shared(ggml_backend_t shared_backend, ggml_backend_t shared_cpu, int n_threads) {
+        backend = ggml_backend_dev_init(ggml_backend_get_device(shared_backend), nullptr);
+        if (!backend) {
+            return false;
+        }
+        if (shared_cpu) {
+            back_cpu = ggml_backend_dev_init(ggml_backend_get_device(shared_cpu), nullptr);
+            if (!back_cpu) {
+                ggml_backend_free(backend);
+                backend = nullptr;
+                return false;
+            }
+        }
+        owns_backends = true;
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU && n_threads > 0) {
+            auto set_n_threads = (ggml_backend_set_n_threads_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_set_n_threads");
+            if (set_n_threads) {
+                set_n_threads(backend, n_threads);
+            }
+        }
+        if (back_cpu && n_threads > 0) {
+            auto set_n_threads = (ggml_backend_set_n_threads_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(back_cpu)), "ggml_backend_set_n_threads");
+            if (set_n_threads) {
+                set_n_threads(back_cpu, n_threads);
+            }
+        }
+        meta.resize(VC_MAX_NODES * ggml_tensor_overhead()
+                    + ggml_graph_overhead_custom(VC_MAX_NODES, false) + (1u << 20));
+        ggml_backend_t backends[2] = { backend, back_cpu };
+        const int n_backends = back_cpu ? 2 : 1;
+        sched = ggml_backend_sched_new(backends, nullptr, n_backends, VC_MAX_NODES, false, true);
+        return sched != nullptr;
     }
 };
 
@@ -280,6 +328,9 @@ struct voicechat_tts {
     // codec frames, and this state is consumed only after text generation and
     // native speech drain have settled.
     std::unique_ptr<mtmd_audio_streaming_istft> stream_istft;
+    vc_sched stream_sched;
+    std::mutex stream_mutex;
+    std::vector<std::vector<int32_t>> stream_frames;
     int  stream_next   = 0;
     bool stream_active = false;
 
@@ -482,7 +533,14 @@ bool voicechat_tts::init_backend(const char * device, int n_threads) {
     // costs a second copy of the weights in RAM, which the 1.5 GiB scratch
     // arena this replaced more than paid for.
     dev_is_cpu = is_cpu;
-    return mirror_weights();
+    if (!mirror_weights()) {
+        return false;
+    }
+    if (!stream_sched.init_shared(sched.backend, sched.back_cpu, n_threads)) {
+        LOG_ERR("voicechat-tts: cannot create the async renderer scheduler\n");
+        return false;
+    }
+    return true;
 }
 
 // Copy every weight into device memory. The host copy stays: the RVQ search,
@@ -1244,7 +1302,8 @@ float voicechat_tts_silence_cos(const voicechat_tts * tts) {
 // latents [n_latent x T] -> spectrogram channels [n_fft+2 x T*up_total].
 // decoded in short chunks with causal overlap so the scratch stays bounded;
 // the discarded overlap output converges because every conv is causal.
-static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<float> & lat, int T) {
+static std::vector<float> codec_decode(voicechat_tts * tts, vc_sched & runner,
+                                       const std::vector<float> & lat, int T) {
     const int n_lat  = tts->n_latent;
     const int n_spec = tts->n_fft + 2;
     int up_total = 1;
@@ -1260,8 +1319,8 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
         const int len  = std::min(chunk, T - start);
         const int L0   = lead + len;
 
-        ggml_context * ctx = tts->sched.begin();
-        ggml_tensor * x = tts->sched.input(n_lat, L0, lat.data() + (size_t) (start - lead) * n_lat);
+        ggml_context * ctx = runner.begin();
+        ggml_tensor * x = runner.input(n_lat, L0, lat.data() + (size_t) (start - lead) * n_lat);
 
         int blk = 0;
         for (int s = 0; s < 3; ++s) {
@@ -1276,10 +1335,10 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
                 const int kk = (int) B.dw_w->ne[0];
                 if ((size_t) C * (kk - 1) > tts->zeros.size()) {
                     LOG_ERR("voicechat-tts: codec pad %d x %d exceeds the zero buffer\n", C, kk - 1);
-                    tts->sched.end();
+                    runner.end();
                     return spec;
                 }
-                ggml_tensor * zpad = tts->sched.input(C, kk - 1, tts->zeros.data());
+                ggml_tensor * zpad = runner.input(C, kk - 1, tts->zeros.data());
                 ggml_tensor * xp = ggml_concat(ctx, zpad, x, 1);              // causal left pad
                 ggml_tensor * y = nullptr;
                 for (int j = 0; j < kk; ++j) {
@@ -1304,11 +1363,11 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
         }
         ggml_tensor * head_w = ggml_reshape_2d(ctx, tts->dec_head, tts->dec_head->ne[1], n_spec);
         x = ggml_mul_mat(ctx, head_w, x);                                     // [n_spec, L]
-        tts->sched.compute({ x });
+        runner.compute({ x });
 
         std::vector<float> xh((size_t) n_spec * L0 * up_total);
-        tts->sched.get(x, xh.data());
-        tts->sched.end();
+        runner.get(x, xh.data());
+        runner.end();
 
         for (int l = 0; l < len * up_total; ++l) {
             memcpy(spec.data() + (size_t) (start * up_total + l) * n_spec,
@@ -1361,7 +1420,7 @@ bool voicechat_tts_write_wav(voicechat_tts * tts, const char * path, int n_skip,
         tts->depthsum(code.data(), lat.data() + (size_t) t * tts->n_latent);
     }
 
-    std::vector<float> spec = codec_decode(tts, lat, lead + T);
+    std::vector<float> spec = codec_decode(tts, tts->sched, lat, lead + T);
     if (lead > 0) {
         int up_total = 1;
         for (int r : tts->dec_rates) {
@@ -1471,30 +1530,57 @@ void voicechat_tts_stream_reset(voicechat_tts * tts, int first) {
         tts->stream_istft = std::make_unique<mtmd_audio_streaming_istft>(tts->n_fft, tts->hop);
     }
     tts->stream_istft->reset();
-    tts->stream_next   = std::min(std::max(first, 0), (int) tts->frames.size());
-    tts->stream_active = true;
+    {
+        std::lock_guard<std::mutex> lock(tts->stream_mutex);
+        tts->stream_frames = tts->frames;
+        tts->stream_next   = std::min(std::max(first, 0), (int) tts->stream_frames.size());
+        tts->stream_active = true;
+    }
+}
+
+void voicechat_tts_stream_publish(voicechat_tts * tts) {
+    if (!tts) {
+        return;
+    }
+    // Copy only the small RVQ code store. The renderer never reads the live
+    // generation vector, so a producer may append the next frame without
+    // racing a worker's codec graph or a vector reallocation.
+    std::lock_guard<std::mutex> lock(tts->stream_mutex);
+    if (tts->stream_active) {
+        tts->stream_frames = tts->frames;
+    }
 }
 
 std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
                                                vc_stream_timing * timing,
                                                int max_frames) {
     std::vector<int16_t> pcm;
-    if (!tts || !tts->stream_active || max_frames <= 0) {
+    if (!tts || max_frames <= 0) {
         return pcm;
     }
 
-    const int n_have = (int) tts->frames.size();
-    if (tts->stream_next >= n_have) {
-        return pcm;
+    int start = 0;
+    int count = 0;
+    std::vector<std::vector<int32_t>> codes;
+    {
+        std::lock_guard<std::mutex> lock(tts->stream_mutex);
+        const int n_have = (int) tts->stream_frames.size();
+        if (!tts->stream_active || tts->stream_next >= n_have) {
+            return pcm;
+        }
+        start = tts->stream_next;
+        count = std::min(max_frames, n_have - start);
+        const int lead = std::min(start, 8);
+        codes.reserve((size_t) lead + count);
+        for (int i = 0; i < lead + count; ++i) {
+            codes.push_back(tts->stream_frames[(size_t) (start - lead + i)]);
+        }
     }
-
-    const int start = tts->stream_next;
-    const int count = std::min(max_frames, n_have - start);
     const int lead  = std::min(start, 8);
 
     std::vector<float> lat((size_t) (lead + count) * tts->n_latent);
     for (int i = 0; i < lead + count; ++i) {
-        std::vector<int32_t> code = tts->frames[start - lead + i];
+        std::vector<int32_t> code = std::move(codes[(size_t) i]);
         for (int q = 0; q < tts->n_quant; ++q) {
             if (code[q] >= tts->n_codebook) {
                 code[q] = tts->silence[q];
@@ -1504,7 +1590,7 @@ std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
     }
 
     const int64_t t_codec = ggml_time_us();
-    const std::vector<float> spec = codec_decode(tts, lat, lead + count);
+    const std::vector<float> spec = codec_decode(tts, tts->stream_sched, lat, lead + count);
     if (timing) {
         timing->codec_us += ggml_time_us() - t_codec;
     }
@@ -1534,7 +1620,10 @@ std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
     // Advance only after all rows for this causal range have been consumed.
     // At turn end callers must keep invoking this until it returns empty before
     // calling stream_flush(), otherwise the final ~80 ms frame is lost.
-    tts->stream_next = start + count;
+    {
+        std::lock_guard<std::mutex> lock(tts->stream_mutex);
+        tts->stream_next = start + count;
+    }
     return pcm;
 }
 
@@ -1544,7 +1633,10 @@ std::vector<int16_t> voicechat_tts_stream_flush(voicechat_tts * tts) {
         return pcm;
     }
     append_pcm16(pcm, tts->stream_istft->flush());
-    tts->stream_active = false;
+    {
+        std::lock_guard<std::mutex> lock(tts->stream_mutex);
+        tts->stream_active = false;
+    }
     return pcm;
 }
 
@@ -1556,6 +1648,8 @@ void voicechat_tts_free(voicechat_tts * tts) {
     if (!tts) {
         return;
     }
+    tts->stream_sched.end();
+    tts->stream_sched.free_all();
     tts->sched.end();
     if (tts->buf_c) { ggml_backend_buffer_free(tts->buf_c); }
     if (tts->buf_w) { ggml_backend_buffer_free(tts->buf_w); }

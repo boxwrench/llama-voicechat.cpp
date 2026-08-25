@@ -40,12 +40,17 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using json = nlohmann::ordered_json;
@@ -391,6 +396,302 @@ struct vc_events {
     }
 };
 
+// D1 renderer boundary. The producer only publishes the current TTS frame
+// snapshot; codec/ISTFT work runs on a worker-owned scheduler and its PCM is
+// handed to a bounded ring. The real playback sink is intentionally outside
+// this class: D3 will connect it to the live timeline, while this prototype
+// uses a real-time discard sink to measure renderer keep-up and underruns.
+struct vc_async_metrics {
+    int64_t first_pcm_us = -1;
+    int64_t render_start_us = -1;
+    int64_t drain_us = -1;
+    int64_t settle_us = -1;
+    int64_t cancel_us = -1;
+    int64_t codec_us = 0;
+    int64_t istft_us = 0;
+    int64_t published_us = 0;
+    size_t pcm_samples = 0;
+    size_t max_ring_samples = 0;
+    size_t underruns = 0;
+    size_t publish_count = 0;
+};
+
+class vc_async_renderer {
+public:
+    explicit vc_async_renderer(voicechat_tts * tts, int ring_ms = 640) :
+        tts(tts), max_ring_samples((size_t) std::max(80, voicechat_tts_sample_rate(tts)) * ring_ms / 1000) {}
+
+    ~vc_async_renderer() {
+        stop();
+    }
+
+    bool start(int first) {
+        if (!tts) {
+            return false;
+        }
+        voicechat_tts_stream_reset(tts, first);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            started = true;
+            accepting = true;
+            render_t0 = clock::now();
+        }
+        worker = std::thread(&vc_async_renderer::render_loop, this);
+        sink = std::thread(&vc_async_renderer::sink_loop, this);
+        return true;
+    }
+
+    // This is intentionally a snapshot/publish operation. It does not wait
+    // for codec work or for the PCM ring; bounded backpressure is owned by the
+    // worker so the 80 ms producer thread never performs codec scheduling.
+    void publish() {
+        const auto t0 = clock::now();
+        voicechat_tts_stream_publish(tts);
+        const auto elapsed = micros(t0, clock::now());
+        std::lock_guard<std::mutex> lock(mu);
+        metrics.published_us += elapsed;
+        metrics.publish_count++;
+        ++publish_generation;
+        cv.notify_all();
+    }
+
+    void finish() {
+        std::lock_guard<std::mutex> lock(mu);
+        accepting = false;
+        input_finished = true;
+        cv.notify_all();
+    }
+
+    // Discards only queued/unheard PCM and asks the worker to stop at the next
+    // codec boundary. No TTS/model cache is reset here; the caller may keep
+    // the conversation timeline alive and start a new renderer pass.
+    void cancel_pending_audio() {
+        const auto t0 = clock::now();
+        std::lock_guard<std::mutex> lock(mu);
+        cancel_requested = true;
+        accepting = false;
+        pcm_ring.clear();
+        ring_samples = 0;
+        cv.notify_all();
+        cancel_t0 = t0;
+    }
+
+    void wait_settled() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            sink_stop = true;
+            cv.notify_all();
+        }
+        if (sink.joinable()) {
+            sink.join();
+        }
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!started) {
+                return;
+            }
+            accepting = false;
+            input_finished = true;
+            sink_stop = true;
+            cancel_requested = true;
+            pcm_ring.clear();
+            ring_samples = 0;
+            cv.notify_all();
+        }
+        if (worker.joinable()) {
+            worker.join();
+        }
+        if (sink.joinable()) {
+            sink.join();
+        }
+        started = false;
+    }
+
+    vc_async_metrics snapshot() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return metrics;
+    }
+
+    bool drained() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return renderer_drained;
+    }
+
+    bool settled() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return playback_settled;
+    }
+
+private:
+    using clock = std::chrono::steady_clock;
+
+    voicechat_tts * tts = nullptr;
+    const size_t max_ring_samples;
+    mutable std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::vector<int16_t>> pcm_ring;
+    size_t ring_samples = 0;
+    bool started = false;
+    bool accepting = false;
+    bool input_finished = false;
+    bool cancel_requested = false;
+    bool sink_stop = false;
+    bool renderer_drained = false;
+    bool playback_settled = false;
+    uint64_t publish_generation = 0;
+    clock::time_point render_t0{};
+    clock::time_point cancel_t0{};
+    std::thread worker;
+    std::thread sink;
+    vc_async_metrics metrics;
+
+    static int64_t micros(clock::time_point a, clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    }
+
+    bool cancelled() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return cancel_requested;
+    }
+
+    bool push_pcm(std::vector<int16_t> && chunk) {
+        if (chunk.empty()) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] {
+            return cancel_requested || ring_samples + chunk.size() <= max_ring_samples;
+        });
+        if (cancel_requested) {
+            if (cancel_t0 != clock::time_point{}) {
+                metrics.cancel_us = micros(cancel_t0, clock::now());
+            }
+            return false;
+        }
+        if (metrics.first_pcm_us < 0) {
+            metrics.first_pcm_us = micros(render_t0, clock::now());
+        }
+        metrics.pcm_samples += chunk.size();
+        ring_samples += chunk.size();
+        metrics.max_ring_samples = std::max(metrics.max_ring_samples, ring_samples);
+        pcm_ring.push_back(std::move(chunk));
+        cv.notify_all();
+        return true;
+    }
+
+    void render_loop() {
+        uint64_t seen_publish = 0;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] {
+                    return cancel_requested || input_finished || publish_generation != seen_publish;
+                });
+                if (cancel_requested) {
+                    if (cancel_t0 != clock::time_point{}) {
+                        metrics.cancel_us = micros(cancel_t0, clock::now());
+                    }
+                    return;
+                }
+                seen_publish = publish_generation;
+            }
+
+            bool made_progress = false;
+            while (!cancelled()) {
+                vc_stream_timing timing;
+                const auto t0 = clock::now();
+                std::vector<int16_t> chunk = voicechat_tts_stream_step(tts, &timing, 8);
+                const int64_t service = micros(t0, clock::now());
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    metrics.render_start_us = metrics.render_start_us < 0
+                        ? micros(render_t0, t0) : metrics.render_start_us;
+                    metrics.codec_us += timing.codec_us;
+                    metrics.istft_us += timing.istft_us;
+                    (void) service;
+                }
+                if (chunk.empty()) {
+                    break;
+                }
+                made_progress = true;
+                if (!push_pcm(std::move(chunk))) {
+                    return;
+                }
+            }
+
+            std::unique_lock<std::mutex> lock(mu);
+            if (cancel_requested) {
+                if (cancel_t0 != clock::time_point{}) {
+                    metrics.cancel_us = micros(cancel_t0, clock::now());
+                }
+                return;
+            }
+            if (input_finished && !made_progress) {
+                lock.unlock();
+                const auto t0 = clock::now();
+                if (!push_pcm(voicechat_tts_stream_flush(tts))) {
+                    return;
+                }
+                lock.lock();
+                renderer_drained = true;
+                metrics.drain_us = micros(render_t0, t0);
+                cv.notify_all();
+                return;
+            }
+            cv.wait(lock, [&] {
+                return cancel_requested || input_finished || publish_generation != seen_publish;
+            });
+        }
+    }
+
+    void sink_loop() {
+        const int sample_rate = voicechat_tts_sample_rate(tts);
+        while (true) {
+            std::vector<int16_t> chunk;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] { return sink_stop || cancel_requested || !pcm_ring.empty() || renderer_drained; });
+                if (cancel_requested || (sink_stop && pcm_ring.empty())) {
+                    return;
+                }
+                if (pcm_ring.empty()) {
+                    if (renderer_drained) {
+                        playback_settled = true;
+                        metrics.settle_us = micros(render_t0, clock::now());
+                        cv.notify_all();
+                        return;
+                    } else {
+                        ++metrics.underruns;
+                    }
+                    continue;
+                }
+                chunk = std::move(pcm_ring.front());
+                pcm_ring.pop_front();
+                ring_samples -= chunk.size();
+                cv.notify_all();
+            }
+            if (sample_rate > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    (int64_t) chunk.size() * 1000000 / sample_rate));
+            }
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (renderer_drained && pcm_ring.empty()) {
+                    playback_settled = true;
+                    metrics.settle_us = micros(render_t0, clock::now());
+                    cv.notify_all();
+                }
+            }
+        }
+    }
+};
+
 // ------------------------------------------------------------------ session
 //
 // The duplex timeline plus everything that hangs off it. Constructed once; a
@@ -404,6 +705,7 @@ struct vc_session {
     function_head          fhead;
     common_sampler *       smpl = nullptr;
     voicechat_tts *        tts  = nullptr;
+    std::unique_ptr<vc_async_renderer> async_renderer;
     llama_batch            batch{};
     bool                   batch_alive = false;
 
@@ -735,6 +1037,7 @@ bool vc_session::init_tts() {
 }
 
 void vc_session::teardown() {
+    async_renderer.reset();
     if (tts) {
         voicechat_tts_free(tts);
         tts = nullptr;
@@ -765,6 +1068,7 @@ void vc_session::reset() {
     tts_voiced    = 0;
     tts_wait      = 0;
     tts_first_tok = -1;
+    async_renderer.reset();
     if (tts) {
         voicechat_tts_free(tts);
         tts = nullptr;
@@ -835,6 +1139,9 @@ void vc_session::tts_feed(llama_token tok) {
     }
 
     voicechat_tts_step(tts, out);
+    if (async_renderer) {
+        async_renderer->publish();
+    }
     const bool quiet = voicechat_tts_silence_cos(tts) >= silence_cos;
     if (pace_dump) {
         LOG_INF("PACE f=%4d q=%3d quiet=%3d voiced=%4d rel=%4d out=%-12s\n",
@@ -978,6 +1285,22 @@ bool vc_session::run_system(const std::string & prompt) {
 // then draining the speech channel until it settles.
 bool vc_session::run_turn(const std::string & wav_path, const std::string & out_wav, json & result) {
     sys_done = true;   // no system prompt may be inserted mid-conversation
+
+    // D1 prototype: publish TTS frame snapshots while the normal timeline
+    // runs. The worker owns codec scheduling; this is intentionally separate
+    // from M3.1's post-turn playback flag and is not a production live sink.
+    if (getenv("VC_TTS_ASYNC_RENDER")) {
+        if (!tts) {
+            ev.error("VC_TTS_ASYNC_RENDER requires --tts");
+            return false;
+        }
+        async_renderer = std::make_unique<vc_async_renderer>(tts);
+        if (!async_renderer->start(0)) {
+            ev.error("could not start async renderer");
+            async_renderer.reset();
+            return false;
+        }
+    }
 
     // ------------------------------------------------------------- encode
     const int64_t t_enc = ggml_time_ms();
@@ -1288,6 +1611,20 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
                 n_drain, n_drain / 12.5, ggml_time_ms() - t_drain);
     }
 
+    if (async_renderer) {
+        async_renderer->finish();
+        async_renderer->wait_settled();
+        const vc_async_metrics m = async_renderer->snapshot();
+        LOG_INF("voicechat-d1: async renderer published=%zu publish_us=%" PRId64
+                " first_pcm_us=%" PRId64 " pcm=%zu max_ring=%zu underruns=%zu"
+                " drain_us=%" PRId64 " settle_us=%" PRId64 " cancel_us=%" PRId64 " codec_us=%" PRId64
+                " istft_us=%" PRId64 "\n",
+                m.publish_count, m.published_us, m.first_pcm_us, m.pcm_samples,
+                m.max_ring_samples, m.underruns, m.drain_us, m.settle_us, m.cancel_us,
+                m.codec_us, m.istft_us);
+        async_renderer.reset();
+    }
+
     // Optional M3.1 recovery path: all text and native TTS generation above
     // have completed, so codec/ISTFT work cannot delay the live 80 ms loop.
     // The complete-WAV path below remains byte-for-byte untouched when neither
@@ -1515,6 +1852,24 @@ static bool vc_say(vc_session & sess, const std::string & text, int pace, const 
     toks.push_back(llama_vocab_eos(sess.vocab));
     LOG_INF("say: %d tokens at 1 per %d frames\n", (int) toks.size(), pace);
 
+    if (getenv("VC_TTS_ASYNC_RENDER")) {
+        sess.async_renderer = std::make_unique<vc_async_renderer>(sess.tts);
+        if (!sess.async_renderer->start(0)) {
+            sess.async_renderer.reset();
+            return false;
+        }
+    }
+    std::thread cancel_timer;
+    if (sess.async_renderer && getenv("VC_TTS_ASYNC_CANCEL_MS")) {
+        const int delay_ms = std::max(0, atoi(getenv("VC_TTS_ASYNC_CANCEL_MS")));
+        cancel_timer = std::thread([&sess, delay_ms] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            if (sess.async_renderer) {
+                sess.async_renderer->cancel_pending_audio();
+            }
+        });
+    }
+
     for (llama_token tok : toks) {
         sess.tts_feed(tok);
         for (int i = 1; i < pace; ++i) {
@@ -1529,6 +1884,22 @@ static bool vc_say(vc_session & sess, const std::string & text, int pace, const 
         if (sess.tts_q.empty() && i >= sess.n_drain_min && n_silent >= sess.n_drain_quiet) {
             break;
         }
+    }
+    if (cancel_timer.joinable()) {
+        cancel_timer.join();
+    }
+    if (sess.async_renderer) {
+        sess.async_renderer->finish();
+        sess.async_renderer->wait_settled();
+        const vc_async_metrics m = sess.async_renderer->snapshot();
+        LOG_INF("voicechat-d1: async renderer published=%zu publish_us=%" PRId64
+                " first_pcm_us=%" PRId64 " pcm=%zu max_ring=%zu underruns=%zu"
+                " drain_us=%" PRId64 " settle_us=%" PRId64 " cancel_us=%" PRId64 " codec_us=%" PRId64
+                " istft_us=%" PRId64 "\n",
+                m.publish_count, m.published_us, m.first_pcm_us, m.pcm_samples,
+                m.max_ring_samples, m.underruns, m.drain_us, m.settle_us, m.cancel_us,
+                m.codec_us, m.istft_us);
+        sess.async_renderer.reset();
     }
     const bool stream_playback = getenv("VC_TTS_STREAM_PLAYBACK") != nullptr;
     const char * stream_out = getenv("VC_TTS_STREAM_OUT");

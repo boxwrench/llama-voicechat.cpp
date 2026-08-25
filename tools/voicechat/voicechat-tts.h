@@ -49,6 +49,9 @@ struct vc_stream_timing {
 };
 
 void voicechat_tts_stream_reset(voicechat_tts * tts, int first);
+// Publish the current generator frame snapshot to an already-running renderer
+// worker. This is non-blocking with respect to codec execution.
+void voicechat_tts_stream_publish(voicechat_tts * tts);
 std::vector<int16_t> voicechat_tts_stream_step(voicechat_tts * tts,
                                                vc_stream_timing * timing = nullptr,
                                                int max_frames = 8);
