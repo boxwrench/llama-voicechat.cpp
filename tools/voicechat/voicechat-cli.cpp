@@ -418,8 +418,10 @@ struct vc_async_metrics {
 
 class vc_async_renderer {
 public:
-    explicit vc_async_renderer(voicechat_tts * tts, int ring_ms = 640) :
-        tts(tts), max_ring_samples((size_t) std::max(80, voicechat_tts_sample_rate(tts)) * ring_ms / 1000) {}
+    explicit vc_async_renderer(voicechat_tts * tts, int ring_ms = 640,
+                               vc_events * events = nullptr, bool alsa_sink = false) :
+        tts(tts), events(events), alsa_sink(alsa_sink),
+        max_ring_samples((size_t) std::max(80, voicechat_tts_sample_rate(tts)) * ring_ms / 1000) {}
 
     ~vc_async_renderer() {
         stop();
@@ -532,6 +534,8 @@ private:
     using clock = std::chrono::steady_clock;
 
     voicechat_tts * tts = nullptr;
+    vc_events * events = nullptr;
+    bool alsa_sink = false;
     const size_t max_ring_samples;
     mutable std::mutex mu;
     std::condition_variable cv;
@@ -652,6 +656,15 @@ private:
 
     void sink_loop() {
         const int sample_rate = voicechat_tts_sample_rate(tts);
+        FILE * pipe = nullptr;
+        bool playback_begun = false;
+        if (alsa_sink) {
+            const std::string cmd = "aplay -q -t raw -f S16_LE -c 1 -r " + std::to_string(sample_rate);
+            pipe = popen(cmd.c_str(), "w");
+            if (pipe) {
+                setvbuf(pipe, nullptr, _IONBF, 0);
+            }
+        }
         while (true) {
             std::vector<int16_t> chunk;
             {
@@ -676,7 +689,20 @@ private:
                 ring_samples -= chunk.size();
                 cv.notify_all();
             }
-            if (sample_rate > 0) {
+            if (pipe) {
+                const bool wrote = fwrite(chunk.data(), sizeof(int16_t), chunk.size(), pipe) == chunk.size() &&
+                                   fflush(pipe) == 0;
+                if (!wrote) {
+                    std::lock_guard<std::mutex> lock(mu);
+                    sink_stop = true;
+                    cv.notify_all();
+                    break;
+                }
+                if (!playback_begun && events) {
+                    events->emit(json{{"kind", "playback_begin"}});
+                    playback_begun = true;
+                }
+            } else if (sample_rate > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(
                     (int64_t) chunk.size() * 1000000 / sample_rate));
             }
@@ -688,6 +714,9 @@ private:
                     cv.notify_all();
                 }
             }
+        }
+        if (pipe) {
+            (void) pclose(pipe);
         }
     }
 };
@@ -706,6 +735,8 @@ struct vc_session {
     common_sampler *       smpl = nullptr;
     voicechat_tts *        tts  = nullptr;
     std::unique_ptr<vc_async_renderer> async_renderer;
+    std::unique_ptr<mtmd_voicechat_d3_stream, decltype(&mtmd_voicechat_d3_stream_free)> d3_stream{
+        nullptr, mtmd_voicechat_d3_stream_free};
     llama_batch            batch{};
     bool                   batch_alive = false;
 
@@ -798,6 +829,8 @@ struct vc_session {
     bool step(const float * a, bool conditioning, llama_token force_func, bool feed_tts);
     bool run_system(const std::string & prompt);
     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
+    bool d3_start(bool alsa_sink);
+    bool d3_step(const float * samples, size_t n_samples, int64_t capture_us, json & telemetry);
 };
 
 static bool write_pcm_wav(const char * path, const std::vector<int16_t> & pcm, int sample_rate) {
@@ -1069,11 +1102,75 @@ void vc_session::reset() {
     tts_wait      = 0;
     tts_first_tok = -1;
     async_renderer.reset();
+    d3_stream.reset();
     if (tts) {
         voicechat_tts_free(tts);
         tts = nullptr;
         init_tts();
     }
+}
+
+bool vc_session::d3_start(bool alsa_sink) {
+    if (d3_stream) {
+        return true;
+    }
+    if (!tts) {
+        ev.error("D3 live mode requires --tts");
+        return false;
+    }
+    d3_stream.reset(mtmd_voicechat_d3_stream_init(ctx_mtmd.get()));
+    if (!d3_stream) {
+        ev.error("could not initialize D3 bounded perception stream");
+        return false;
+    }
+    async_renderer = std::make_unique<vc_async_renderer>(tts, 640, &ev, alsa_sink);
+    if (!async_renderer->start(voicechat_tts_n_frames(tts))) {
+        ev.error("could not start D3 async renderer");
+        async_renderer.reset();
+        d3_stream.reset();
+        return false;
+    }
+    sys_done = true;
+    return true;
+}
+
+bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t capture_us, json & telemetry) {
+    // D3-0 is intentionally a fixed live contract. The client may buffer
+    // capture, but it cannot authorize the timeline with an arbitrary amount
+    // of future microphone audio in one request.
+    constexpr size_t d3_slice_samples = 1280; // 80 ms at 16 kHz
+    if (!d3_stream || samples == nullptr || n_samples != d3_slice_samples) {
+        return false;
+    }
+    const int64_t frame_id = t;
+    std::vector<float> embedding((size_t) n_embd);
+    bool ready = false;
+    const int64_t p0 = ggml_time_us();
+    if (!mtmd_voicechat_d3_stream_step(d3_stream.get(), samples, n_samples,
+                                       embedding.data(), embedding.size(), &ready)) {
+        return false;
+    }
+    const int64_t p1 = ggml_time_us();
+    if (!ready) {
+        telemetry = json{{"kind", "d3_frame_wait"}, {"capture_us", capture_us},
+                         {"timeline_frame", frame_id}, {"perception_us", p1 - p0}};
+        return true;
+    }
+    const int64_t m0 = ggml_time_us();
+    if (!step(embedding.data(), false, -1, true)) {
+        return false;
+    }
+    const int64_t m1 = ggml_time_us();
+    const vc_async_metrics rm = async_renderer ? async_renderer->snapshot() : vc_async_metrics{};
+    const int64_t total = m1 - p0;
+    telemetry = json{{"kind", "d3_frame"}, {"capture_us", capture_us},
+                     {"timeline_frame", frame_id}, {"perception_start_us", p0},
+                     {"perception_end_us", p1}, {"main_start_us", m0}, {"main_end_us", m1},
+                     {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
+                     {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
+                     {"timeline_backlog", 0}, {"deadline_miss_80ms", total > 80000},
+                     {"frame_total_us", total}};
+    return true;
 }
 
 // The text channel on its way to the speech channel.
@@ -1784,6 +1881,8 @@ static json parse_line(const std::string & line, bool & ok) {
 //
 //   {"cmd":"system","text":"..."}                  before the first turn only
 //   {"cmd":"turn","audio":"in.wav","out":"out.wav"}
+//   {"cmd":"live_start","alsa":true}
+//   {"cmd":"live_frame","capture_us":...,"pcm_f32":[1280 samples]}
 //   {"cmd":"tool_response","text":"..."}           only while a call is pending
 //   {"cmd":"reset"} {"cmd":"ping"} {"cmd":"quit"}
 static int vc_serve(vc_session & sess) {
@@ -1858,6 +1957,43 @@ static int vc_serve(vc_session & sess) {
                 return 1;
             }
             sess.ev.emit(json{{"kind", "system"}, {"t", sess.t}});
+            continue;
+        }
+        if (c == "live_start") {
+            if (sess.t != 0 || sess.sys_done) {
+                sess.ev.error("live_start must begin a fresh session");
+                continue;
+            }
+            if (!sess.d3_start(cmd.value("alsa", false))) {
+                sess.ev.error("D3 live start failed");
+                continue;
+            }
+            sess.ev.emit(json{{"kind", "d3_live_start"}, {"frame_rate", 12.5},
+                              {"slice_samples", 1280}, {"sample_rate", 16000}});
+            continue;
+        }
+        if (c == "live_frame") {
+            if (!cmd.contains("pcm_f32") || !cmd["pcm_f32"].is_array()) {
+                sess.ev.error("live_frame requires pcm_f32 array");
+                continue;
+            }
+            const auto & values = cmd["pcm_f32"];
+            std::vector<float> pcm;
+            pcm.reserve(values.size());
+            for (const auto & value : values) {
+                if (!value.is_number()) {
+                    pcm.clear();
+                    break;
+                }
+                pcm.push_back(value.get<float>());
+            }
+            json telemetry;
+            if (pcm.size() != 1280 || !sess.d3_step(pcm.data(), pcm.size(),
+                    cmd.value("capture_us", (int64_t) 0), telemetry)) {
+                sess.ev.error("D3 live_frame failed (requires exactly 1280 F32 samples)");
+                continue;
+            }
+            sess.ev.emit(telemetry);
             continue;
         }
         if (c == "turn") {

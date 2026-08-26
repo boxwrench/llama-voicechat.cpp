@@ -4,6 +4,7 @@
 #include "clip-model.h"
 
 #include <cstdint>
+#include <deque>
 #include <vector>
 #include <string>
 
@@ -160,6 +161,25 @@ struct mtmd_audio_preprocessor_parakeet : mtmd_audio_preprocessor {
     bool preprocess_streaming_exact(const float * samples, size_t n_samples,
                                     size_t chunk_samples,
                                     std::vector<mtmd_audio_mel> & output);
+
+    // Persistent, bounded no-normalization frontend state for D3. Each push
+    // accepts newly captured PCM and returns only mel frames whose complete
+    // centered STFT window has become available. It never retains completed
+    // utterance history. Right-padding is deliberately a separate lifecycle
+    // operation: an always-listening session has no end of input between
+    // ordinary microphone slices.
+    struct streaming_state {
+        std::deque<float> preprocessed;
+        size_t base_index = 0;
+        size_t n_received = 0;
+        float previous_raw = 0.0f;
+        bool have_previous_raw = false;
+        int64_t next_frame = 0;
+    };
+
+    bool streaming_reset(streaming_state & state) const;
+    bool streaming_push(streaming_state & state, const float * samples,
+                        size_t n_samples, mtmd_audio_mel & output) const;
 
   private:
     bool norm_per_feature;

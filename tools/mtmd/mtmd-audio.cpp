@@ -11,6 +11,7 @@
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <stdexcept>
 
 // some of the code here is copied from whisper.cpp
 
@@ -1185,6 +1186,104 @@ void mtmd_audio_preprocessor_parakeet::initialize() {
     GGML_ASSERT(hparams.window.size() == (size_t)hparams.audio_window_len);
     GGML_ASSERT(hparams.window.size() <= (size_t) hparams.audio_n_fft);
     cache.hann_window = hparams.window;
+}
+
+bool mtmd_audio_preprocessor_parakeet::streaming_reset(streaming_state & state) const {
+    if (norm_per_feature) {
+        LOG_ERR("%s: streaming VoiceChat frontend requires norm_per_feature=false\n", __func__);
+        return false;
+    }
+    state = {};
+    return true;
+}
+
+bool mtmd_audio_preprocessor_parakeet::streaming_push(
+        streaming_state & state, const float * samples, size_t n_samples,
+        mtmd_audio_mel & output) const {
+    if (samples == nullptr || n_samples == 0 || norm_per_feature) {
+        return false;
+    }
+
+    const int frame_size = hparams.audio_n_fft;
+    const int window_size = hparams.audio_window_len;
+    const int frame_step = hparams.audio_hop_len;
+    const int n_fft_bins = 1 + frame_size / 2;
+    const int window_pad_left = (frame_size - window_size) / 2;
+    const int window_left_context = frame_size / 2 - window_pad_left;
+    const float preemph = 0.97f;
+    const double eps = 5.960464477539063e-08;
+
+    GGML_ASSERT(frame_size > 0 && window_size > 0 && frame_step > 0);
+    GGML_ASSERT(window_size <= frame_size);
+    GGML_ASSERT((int) cache.hann_window.size() == window_size);
+    GGML_ASSERT((int64_t) cache.filters.data.size() ==
+                (int64_t) hparams.n_mel_bins * n_fft_bins);
+
+    for (size_t i = 0; i < n_samples; ++i) {
+        const float raw = samples[i];
+        state.preprocessed.push_back(state.have_previous_raw
+            ? raw - preemph * state.previous_raw : raw);
+        state.previous_raw = raw;
+        state.have_previous_raw = true;
+        ++state.n_received;
+    }
+
+    std::vector<float> frames;
+    auto sample_at = [&](int64_t index) -> float {
+        if (index < 0 || index >= (int64_t) state.n_received) {
+            return 0.0f;
+        }
+        if (index < (int64_t) state.base_index ||
+            index >= (int64_t) state.base_index + (int64_t) state.preprocessed.size()) {
+            throw std::runtime_error("VoiceChat streaming frontend lost a required waveform sample");
+        }
+        return state.preprocessed[(size_t) (index - (int64_t) state.base_index)];
+    };
+
+    auto emit_frame = [&](int64_t frame) {
+        std::vector<float> fft_in((size_t) frame_size * 2, 0.0f);
+        std::vector<float> fft_out((size_t) frame_size * 2 * 2 * 2, 0.0f);
+        const int64_t first_sample = frame * frame_step - window_left_context;
+        for (int j = 0; j < window_size; ++j) {
+            fft_in[(size_t) window_pad_left + (size_t) j] =
+                cache.hann_window[(size_t) j] * sample_at(first_sample + j);
+        }
+        fft(cache, fft_in.data(), frame_size, fft_out.data());
+        for (int j = 0; j < n_fft_bins; ++j) {
+            fft_out[(size_t) j] = fft_out[(size_t) (2 * j + 0)] * fft_out[(size_t) (2 * j + 0)] +
+                                  fft_out[(size_t) (2 * j + 1)] * fft_out[(size_t) (2 * j + 1)];
+        }
+        for (int mel = 0; mel < hparams.n_mel_bins; ++mel) {
+            double sum = 0.0;
+            const size_t filter_base = (size_t) mel * (size_t) n_fft_bins;
+            for (int k = 0; k < n_fft_bins; ++k) {
+                sum += fft_out[(size_t) k] * cache.filters.data[filter_base + (size_t) k];
+            }
+            frames.push_back((float) std::log(sum + eps));
+        }
+    };
+
+    while (state.n_received >= (size_t) (state.next_frame * frame_step + window_size / 2)) {
+        emit_frame(state.next_frame++);
+        const int64_t keep_from = state.next_frame * frame_step - window_left_context;
+        while (!state.preprocessed.empty() && (int64_t) state.base_index < keep_from) {
+            state.preprocessed.pop_front();
+            ++state.base_index;
+        }
+    }
+
+    output = {};
+    output.n_mel = hparams.n_mel_bins;
+    output.n_len = frames.size() / (size_t) output.n_mel;
+    output.n_len_org = output.n_len;
+    output.data.resize(frames.size());
+    for (int64_t frame = 0; frame < output.n_len; ++frame) {
+        for (int mel = 0; mel < output.n_mel; ++mel) {
+            output.data[(size_t) mel * (size_t) output.n_len + (size_t) frame] =
+                frames[(size_t) frame * (size_t) output.n_mel + (size_t) mel];
+        }
+    }
+    return true;
 }
 
 bool mtmd_audio_preprocessor_parakeet::preprocess_streaming_exact(

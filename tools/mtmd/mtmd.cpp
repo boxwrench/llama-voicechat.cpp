@@ -24,6 +24,7 @@
 #include <cstring>
 #include <climits>
 #include <cctype>
+#include <deque>
 #include <type_traits>
 #include <vector>
 
@@ -2396,6 +2397,132 @@ bool mtmd_voicechat_d2_streaming_frontend(
     LOG_INF("%s: frames=%d first_bad_preenc=%d preenc_min_cos=%.9f preenc_rmse=%.6g preenc_abs=%.6g\n",
             __func__, n_frames, first_bad_preenc, metrics->min_preenc_cosine,
             metrics->max_preenc_rmse, metrics->max_preenc_abs);
+    return true;
+}
+
+// D3-0 keeps this bridge deliberately small and explicit. The frontend state
+// is persistent and exact for the no-normalization contract. The preencoder
+// still uses the already-qualified bounded 33-row causal window while D2's
+// minimal per-stage cache is productionized separately. It never consumes
+// future mel rows: output k sees exactly raw mel [8k-14, 8k].
+struct mtmd_voicechat_d3_stream {
+    mtmd_context * ctx = nullptr;
+    mtmd_audio_preprocessor_parakeet * frontend = nullptr;
+    mtmd_audio_preprocessor_parakeet::streaming_state frontend_state;
+    std::unique_ptr<clip_voicechat_stream, decltype(&clip_voicechat_stream_free)> encoder{
+        nullptr, clip_voicechat_stream_free};
+    std::deque<std::vector<float>> mel_rows;
+    int64_t mel_base = 0;
+    int64_t next_output = 0;
+};
+
+mtmd_voicechat_d3_stream * mtmd_voicechat_d3_stream_init(mtmd_context * ctx) {
+    if (ctx == nullptr || ctx->ctx_a == nullptr ||
+        clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
+        return nullptr;
+    }
+    auto * frontend = dynamic_cast<mtmd_audio_preprocessor_parakeet *>(ctx->audio_preproc.get());
+    if (frontend == nullptr) {
+        return nullptr;
+    }
+    auto * stream = new mtmd_voicechat_d3_stream;
+    stream->ctx = ctx;
+    stream->frontend = frontend;
+    stream->encoder.reset(clip_voicechat_stream_init(ctx->ctx_a, ctx->n_threads));
+    if (!stream->encoder || !frontend->streaming_reset(stream->frontend_state)) {
+        delete stream;
+        return nullptr;
+    }
+    return stream;
+}
+
+void mtmd_voicechat_d3_stream_free(mtmd_voicechat_d3_stream * stream) {
+    delete stream;
+}
+
+bool mtmd_voicechat_d3_stream_reset(mtmd_voicechat_d3_stream * stream) {
+    if (stream == nullptr || !stream->frontend->streaming_reset(stream->frontend_state)) {
+        return false;
+    }
+    stream->encoder.reset(clip_voicechat_stream_init(stream->ctx->ctx_a, stream->ctx->n_threads));
+    stream->mel_rows.clear();
+    stream->mel_base = 0;
+    stream->next_output = 0;
+    return stream->encoder != nullptr;
+}
+
+bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
+        const float * samples, size_t n_samples, float * embedding_out,
+        size_t embedding_capacity, bool * embedding_ready) {
+    if (stream == nullptr || samples == nullptr || embedding_out == nullptr ||
+        embedding_ready == nullptr) {
+        return false;
+    }
+    *embedding_ready = false;
+    mtmd_audio_mel emitted;
+    if (!stream->frontend->streaming_push(stream->frontend_state, samples, n_samples, emitted)) {
+        return false;
+    }
+    for (int64_t frame = 0; frame < emitted.n_len; ++frame) {
+        std::vector<float> row((size_t) emitted.n_mel);
+        for (int mel = 0; mel < emitted.n_mel; ++mel) {
+            row[(size_t) mel] = emitted.data[(size_t) mel * (size_t) emitted.n_len + (size_t) frame];
+        }
+        stream->mel_rows.push_back(std::move(row));
+    }
+    if (stream->mel_rows.empty()) {
+        return true;
+    }
+
+    const int64_t last_mel = stream->mel_base + (int64_t) stream->mel_rows.size() - 1;
+    const int64_t target_mel = 8 * stream->next_output;
+    if (last_mel < target_mel) {
+        return true;
+    }
+    const int64_t first_mel = stream->next_output < 4 ? 0 : 8 * (stream->next_output - 4);
+    const int window_frames = (int) (target_mel - first_mel + 1);
+    const int local_target = std::min<int64_t>(stream->next_output, 4);
+    if (first_mel < stream->mel_base || window_frames < 1 || window_frames > 33) {
+        return false;
+    }
+    const int n_mel = (int) stream->mel_rows.front().size();
+    std::vector<float> window((size_t) n_mel * (size_t) window_frames, 0.0f);
+    for (int local = 0; local < window_frames; ++local) {
+        const auto & row = stream->mel_rows[(size_t) (first_mel + local - stream->mel_base)];
+        for (int mel = 0; mel < n_mel; ++mel) {
+            window[(size_t) mel * (size_t) window_frames + (size_t) local] = row[(size_t) mel];
+        }
+    }
+    clip_image_f32 image;
+    image.set_size({window_frames, n_mel}, false, true);
+    image.cpy_buf(window);
+    clip_image_f32_batch batch;
+    batch.is_audio = true;
+    batch.entries.push_back(std::move(image));
+    std::vector<float> ignored, preenc;
+    if (!clip_image_batch_encode_with_preenc(stream->ctx->ctx_a, stream->ctx->n_threads,
+                                              &batch, ignored, preenc) ||
+        preenc.empty() || preenc.size() % (size_t) (local_target + 1) != 0) {
+        return false;
+    }
+    const size_t preenc_width = preenc.size() / (size_t) (local_target + 1);
+    if (preenc_width != 1024 || embedding_capacity < (size_t) clip_n_mmproj_embd(stream->ctx->ctx_a)) {
+        return false;
+    }
+    std::vector<float> projected;
+    if (!clip_voicechat_stream_step(stream->encoder.get(),
+                                    preenc.data() + (size_t) local_target * preenc_width,
+                                    projected) || projected.size() > embedding_capacity) {
+        return false;
+    }
+    std::memcpy(embedding_out, projected.data(), projected.size() * sizeof(float));
+    ++stream->next_output;
+    const int64_t keep_from = stream->next_output < 4 ? 0 : 8 * (stream->next_output - 4);
+    while (!stream->mel_rows.empty() && stream->mel_base < keep_from) {
+        stream->mel_rows.pop_front();
+        ++stream->mel_base;
+    }
+    *embedding_ready = true;
     return true;
 }
 

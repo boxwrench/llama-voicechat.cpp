@@ -348,6 +348,20 @@ MTMD_API bool mtmd_voicechat_d2_streaming_frontend(
         float * stateful_embd_out, int32_t * n_frames_out,
         struct mtmd_voicechat_d2_metrics * metrics);
 
+// D3-0 live causal boundary. A stream owns the no-normalization PCM/mel
+// frontier, the bounded causal preencoder bridge, and the D2 encoder state.
+// One successful `step` consumes newly captured PCM and may authorize at most
+// one projected VoiceChat embedding. The caller owns timeline advancement and
+// must not advance it when `embedding_ready` is false.
+struct mtmd_voicechat_d3_stream;
+MTMD_API struct mtmd_voicechat_d3_stream * mtmd_voicechat_d3_stream_init(
+        mtmd_context * ctx);
+MTMD_API void mtmd_voicechat_d3_stream_free(struct mtmd_voicechat_d3_stream * stream);
+MTMD_API bool mtmd_voicechat_d3_stream_reset(struct mtmd_voicechat_d3_stream * stream);
+MTMD_API bool mtmd_voicechat_d3_stream_step(struct mtmd_voicechat_d3_stream * stream,
+        const float * samples, size_t n_samples, float * embedding_out,
+        size_t embedding_capacity, bool * embedding_ready);
+
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
