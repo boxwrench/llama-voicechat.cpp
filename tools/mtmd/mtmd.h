@@ -361,6 +361,10 @@ MTMD_API bool mtmd_voicechat_d3_stream_reset(struct mtmd_voicechat_d3_stream * s
 MTMD_API bool mtmd_voicechat_d3_stream_step(struct mtmd_voicechat_d3_stream * stream,
         const float * samples, size_t n_samples, float * embedding_out,
         size_t embedding_capacity, bool * embedding_ready);
+// Logical dynamic state retained by the D3 live path: bounded encoder history,
+// current frontend overlap, and causal preencoder rows. Intended for live
+// telemetry; it excludes model weights and allocator capacity.
+MTMD_API size_t mtmd_voicechat_d3_stream_state_bytes(const struct mtmd_voicechat_d3_stream * stream);
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:

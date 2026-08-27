@@ -737,6 +737,7 @@ struct vc_session {
     std::unique_ptr<vc_async_renderer> async_renderer;
     std::unique_ptr<mtmd_voicechat_d3_stream, decltype(&mtmd_voicechat_d3_stream_free)> d3_stream{
         nullptr, mtmd_voicechat_d3_stream_free};
+    bool d3_feed_tts = true;
     llama_batch            batch{};
     bool                   batch_alive = false;
 
@@ -829,7 +830,7 @@ struct vc_session {
     bool step(const float * a, bool conditioning, llama_token force_func, bool feed_tts);
     bool run_system(const std::string & prompt);
     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
-    bool d3_start(bool alsa_sink);
+    bool d3_start(bool alsa_sink, bool enable_renderer, bool enable_tts);
     bool d3_step(const float * samples, size_t n_samples, int64_t capture_us, json & telemetry);
 };
 
@@ -1103,6 +1104,7 @@ void vc_session::reset() {
     tts_first_tok = -1;
     async_renderer.reset();
     d3_stream.reset();
+    d3_feed_tts = true;
     if (tts) {
         voicechat_tts_free(tts);
         tts = nullptr;
@@ -1110,11 +1112,15 @@ void vc_session::reset() {
     }
 }
 
-bool vc_session::d3_start(bool alsa_sink) {
+bool vc_session::d3_start(bool alsa_sink, bool enable_renderer, bool enable_tts) {
     if (d3_stream) {
         return true;
     }
-    if (!tts) {
+    if (enable_renderer && !enable_tts) {
+        ev.error("D3 renderer requires D3 TTS publication");
+        return false;
+    }
+    if (enable_tts && !tts) {
         ev.error("D3 live mode requires --tts");
         return false;
     }
@@ -1123,13 +1129,16 @@ bool vc_session::d3_start(bool alsa_sink) {
         ev.error("could not initialize D3 bounded perception stream");
         return false;
     }
-    async_renderer = std::make_unique<vc_async_renderer>(tts, 640, &ev, alsa_sink);
-    if (!async_renderer->start(voicechat_tts_n_frames(tts))) {
-        ev.error("could not start D3 async renderer");
-        async_renderer.reset();
-        d3_stream.reset();
-        return false;
+    if (enable_renderer) {
+        async_renderer = std::make_unique<vc_async_renderer>(tts, 640, &ev, alsa_sink);
+        if (!async_renderer->start(voicechat_tts_n_frames(tts))) {
+            ev.error("could not start D3 async renderer");
+            async_renderer.reset();
+            d3_stream.reset();
+            return false;
+        }
     }
+    d3_feed_tts = enable_tts;
     sys_done = true;
     return true;
 }
@@ -1157,17 +1166,19 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
         return true;
     }
     const int64_t m0 = ggml_time_us();
-    if (!step(embedding.data(), false, -1, true)) {
+    if (!step(embedding.data(), false, -1, d3_feed_tts)) {
         return false;
     }
     const int64_t m1 = ggml_time_us();
     const vc_async_metrics rm = async_renderer ? async_renderer->snapshot() : vc_async_metrics{};
     const int64_t total = m1 - p0;
+    const size_t d3_state_bytes = mtmd_voicechat_d3_stream_state_bytes(d3_stream.get());
     telemetry = json{{"kind", "d3_frame"}, {"capture_us", capture_us},
                      {"timeline_frame", frame_id}, {"perception_start_us", p0},
                      {"perception_end_us", p1}, {"main_start_us", m0}, {"main_end_us", m1},
                      {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
                      {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
+                     {"d3_state_bytes", d3_state_bytes},
                      {"timeline_backlog", 0}, {"deadline_miss_80ms", total > 80000},
                      {"frame_total_us", total}};
     return true;
@@ -1964,12 +1975,15 @@ static int vc_serve(vc_session & sess) {
                 sess.ev.error("live_start must begin a fresh session");
                 continue;
             }
-            if (!sess.d3_start(cmd.value("alsa", false))) {
+            const bool enable_renderer = cmd.value("renderer", true);
+            const bool enable_tts = cmd.value("tts", true);
+            if (!sess.d3_start(cmd.value("alsa", false), enable_renderer, enable_tts)) {
                 sess.ev.error("D3 live start failed");
                 continue;
             }
             sess.ev.emit(json{{"kind", "d3_live_start"}, {"frame_rate", 12.5},
-                              {"slice_samples", 1280}, {"sample_rate", 16000}});
+                              {"slice_samples", 1280}, {"sample_rate", 16000},
+                              {"renderer", enable_renderer}, {"tts", enable_tts}});
             continue;
         }
         if (c == "live_frame") {

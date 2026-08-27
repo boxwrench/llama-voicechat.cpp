@@ -2526,6 +2526,18 @@ bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
     return true;
 }
 
+size_t mtmd_voicechat_d3_stream_state_bytes(const mtmd_voicechat_d3_stream * stream) {
+    if (stream == nullptr) {
+        return 0;
+    }
+    size_t bytes = clip_voicechat_stream_state_bytes(stream->encoder.get());
+    bytes += stream->frontend_state.preprocessed.size() * sizeof(float);
+    for (const auto & row : stream->mel_rows) {
+        bytes += row.size() * sizeof(float);
+    }
+    return bytes;
+}
+
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
     try {
         return mtmd_encode_impl(ctx, image_tokens, ctx->out_embd);
