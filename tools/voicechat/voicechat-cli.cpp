@@ -745,6 +745,17 @@ struct vc_session {
     std::unique_ptr<mtmd_voicechat_d3_stream, decltype(&mtmd_voicechat_d3_stream_free)> d3_stream{
         nullptr, mtmd_voicechat_d3_stream_free};
     bool d3_feed_tts = true;
+    // Per-authorized-frame native-TTS attribution.  Reset immediately before
+    // the D3 main step; it observes the existing call order only.
+    vc_tts_step_timing d3_tts_timing{};
+    int64_t d3_tts_queue_us = 0;
+    int64_t d3_tts_step_us = 0;
+    int64_t d3_tts_silence_us = 0;
+    int64_t d3_tts_publish_us = 0;
+    llama_token d3_tts_output_token = -1;
+    int d3_tts_frame_count = 0;
+    uint64_t d3_tts_last_frame_hash = 0;
+    bool d3_tts_called = false;
     llama_batch            batch{};
     bool                   batch_alive = false;
 
@@ -1175,6 +1186,15 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
         return true;
     }
     const int64_t m0 = ggml_time_us();
+    d3_tts_timing = {};
+    d3_tts_queue_us = 0;
+    d3_tts_step_us = 0;
+    d3_tts_silence_us = 0;
+    d3_tts_publish_us = 0;
+    d3_tts_output_token = -1;
+    d3_tts_frame_count = 0;
+    d3_tts_last_frame_hash = 0;
+    d3_tts_called = false;
     if (!step(embedding.data(), false, -1, d3_feed_tts)) {
         return false;
     }
@@ -1213,6 +1233,30 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
                      {"d2_encoder_compute_us", perception_timing.encoder_compute_us},
                      {"d2_encoder_output_state_us", perception_timing.encoder_output_state_us},
                      {"d2_state_cache_us", perception_timing.state_cache_us},
+                     {"tts_called", d3_tts_called},
+                     {"tts_queue_us", d3_tts_queue_us},
+                     {"tts_step_us", d3_tts_step_us},
+                     {"tts_prepare_us", d3_tts_timing.prepare_us},
+                     {"tts_condition_us", d3_tts_timing.condition_us},
+                     {"tts_condition_cache_hit", d3_tts_timing.condition_cache_hit},
+                     {"tts_backbone_build_us", d3_tts_timing.backbone_build_us},
+                     {"tts_backbone_alloc_us", d3_tts_timing.backbone_alloc_us},
+                     {"tts_backbone_upload_us", d3_tts_timing.backbone_upload_us},
+                     {"tts_backbone_compute_wait_us", d3_tts_timing.backbone_compute_wait_us},
+                     {"tts_backbone_output_us", d3_tts_timing.backbone_output_us},
+                     {"tts_code_build_us", d3_tts_timing.code_build_us},
+                     {"tts_code_prepare_us", d3_tts_timing.code_prepare_us},
+                     {"tts_code_alloc_us", d3_tts_timing.code_alloc_us},
+                     {"tts_code_upload_us", d3_tts_timing.code_upload_us},
+                     {"tts_code_compute_wait_us", d3_tts_timing.code_compute_wait_us},
+                     {"tts_code_output_us", d3_tts_timing.code_output_us},
+                     {"tts_code_cpu_us", d3_tts_timing.code_cpu_us},
+                     {"tts_state_append_us", d3_tts_timing.state_append_us},
+                     {"tts_silence_us", d3_tts_silence_us},
+                     {"tts_snapshot_publish_us", d3_tts_publish_us},
+                     {"tts_output_token", d3_tts_output_token},
+                     {"tts_frame_count", d3_tts_frame_count},
+                     {"tts_last_frame_hash", d3_tts_last_frame_hash},
                      {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
                      {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
                      {"function_token", last_func}, {"function_head_gpu", fhead.gpu},
@@ -1251,6 +1295,7 @@ void vc_session::tts_feed(llama_token tok) {
     if (!tts) {
         return;
     }
+    const int64_t t_queue = ggml_time_us();
     if (tok != tok_pad) {
         tts_q.push_back(tok);
     }
@@ -1285,11 +1330,22 @@ void vc_session::tts_feed(llama_token tok) {
         }
     }
 
-    voicechat_tts_step(tts, out);
+    d3_tts_queue_us = ggml_time_us() - t_queue;
+    const int64_t t_step = ggml_time_us();
+    voicechat_tts_step(tts, out, &d3_tts_timing);
+    d3_tts_step_us = ggml_time_us() - t_step;
+    d3_tts_output_token = out;
+    d3_tts_frame_count = voicechat_tts_n_frames(tts);
+    d3_tts_last_frame_hash = voicechat_tts_last_frame_hash(tts);
+    d3_tts_called = true;
     if (async_renderer) {
+        const int64_t t_publish = ggml_time_us();
         async_renderer->publish();
+        d3_tts_publish_us = ggml_time_us() - t_publish;
     }
+    const int64_t t_silence = ggml_time_us();
     const bool quiet = voicechat_tts_silence_cos(tts) >= silence_cos;
+    d3_tts_silence_us = ggml_time_us() - t_silence;
     if (pace_dump) {
         LOG_INF("PACE f=%4d q=%3d quiet=%3d voiced=%4d rel=%4d out=%-12s\n",
                 voicechat_tts_n_frames(tts), (int) tts_q.size(), tts_quiet, tts_voiced,

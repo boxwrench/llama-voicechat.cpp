@@ -124,6 +124,12 @@ struct vc_sched {
     };
     std::vector<upload> pending;
 
+    struct timing {
+        int64_t alloc_us = 0;
+        int64_t upload_us = 0;
+        int64_t compute_wait_us = 0;
+    };
+
     ggml_context * begin() {
         ggml_backend_sched_reset(sched);
         ggml_init_params ip = { meta.size(), meta.data(), /*.no_alloc =*/ true };
@@ -141,19 +147,32 @@ struct vc_sched {
         return t;
     }
 
-    bool compute(std::initializer_list<ggml_tensor *> outs) {
+    bool compute(std::initializer_list<ggml_tensor *> outs, timing * timing_out = nullptr) {
         for (ggml_tensor * t : outs) {
             ggml_set_output(t);          // before the alloc, or it gets reused
             ggml_build_forward_expand(gf, t);
         }
+        const int64_t t_alloc = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LOG_ERR("voicechat-tts: graph allocation failed\n");
             return false;
         }
+        if (timing_out) {
+            timing_out->alloc_us += ggml_time_us() - t_alloc;
+        }
+        const int64_t t_upload = ggml_time_us();
         for (const upload & u : pending) {
             ggml_backend_tensor_set(u.t, u.src, 0, ggml_nbytes(u.t));
         }
-        return ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        if (timing_out) {
+            timing_out->upload_us += ggml_time_us() - t_upload;
+        }
+        const int64_t t_compute = ggml_time_us();
+        const bool ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        if (timing_out) {
+            timing_out->compute_wait_us += ggml_time_us() - t_compute;
+        }
+        return ok;
     }
 
     void get(const ggml_tensor * t, void * dst, size_t off = 0, size_t n = 0) const {
@@ -338,10 +357,12 @@ struct voicechat_tts {
     bool init_backend(const char * device, int n_threads);
     bool mirror_weights();
     bool warmup();
-    void frame_cond(int32_t tok, float * out);
+    void frame_cond(int32_t tok, float * out, vc_tts_step_timing * timing = nullptr);
     void backbone_step(const float * code_emb, const float * cond,
-                       int n_tok, const float * mask, float * h_cond, float * h_uncond);
-    void generate_codes(const float * h_cond, const float * h_uncond, int32_t * code);
+                       int n_tok, const float * mask, float * h_cond, float * h_uncond,
+                       vc_tts_step_timing * timing = nullptr);
+    void generate_codes(const float * h_cond, const float * h_uncond, int32_t * code,
+                        vc_tts_step_timing * timing = nullptr);
     void depthsum(const int32_t * code, float * out) const;
 
     ggml_tensor * build_gemma_block(ggml_context * ctx, const vc_tts_layer & L, ggml_tensor * x,
@@ -910,10 +931,15 @@ void voicechat_tts::depthsum(const int32_t * code, float * out) const {
 }
 
 // conditioning vector for one text token: char aware subword encoder + flags
-void voicechat_tts::frame_cond(int32_t tok, float * out) {
+void voicechat_tts::frame_cond(int32_t tok, float * out, vc_tts_step_timing * timing) {
+    const int64_t t0 = ggml_time_us();
     auto it = cond_cache.find(tok);
     if (it != cond_cache.end()) {
         memcpy(out, it->second.data(), n_embd * sizeof(float));
+        if (timing) {
+            timing->condition_cache_hit = true;
+            timing->condition_us += ggml_time_us() - t0;
+        }
         return;
     }
 
@@ -967,12 +993,17 @@ void voicechat_tts::frame_cond(int32_t tok, float * out) {
 
     cond_cache[tok] = cond;
     memcpy(out, cond.data(), n_embd * sizeof(float));
+    if (timing) {
+        timing->condition_us += ggml_time_us() - t0;
+    }
 }
 
 // one backbone pass over n_tok new positions; code_emb/cond carry 2*n_tok rows
 // (conditional rows first). h_cond/h_uncond receive the last position's state.
 void voicechat_tts::backbone_step(const float * code_emb, const float * cond,
-                                  int n_tok, const float * mask, float * h_cond, float * h_uncond) {
+                                  int n_tok, const float * mask, float * h_cond, float * h_uncond,
+                                  vc_tts_step_timing * timing) {
+    const int64_t t_build = ggml_time_us();
     const int n = 2 * n_tok;
 
     ggml_context * ctx = sched.begin();
@@ -1008,20 +1039,34 @@ void voicechat_tts::backbone_step(const float * code_emb, const float * cond,
                               cache_k[il], cache_v[il], pos, n_tok);
     }
     x = rms(ctx, x, output_norm, eps);
-    sched.compute({ x });
+    if (timing) {
+        timing->backbone_build_us += ggml_time_us() - t_build;
+    }
+    vc_sched::timing sched_timing;
+    sched.compute({ x }, timing ? &sched_timing : nullptr);
+    if (timing) {
+        timing->backbone_alloc_us += sched_timing.alloc_us;
+        timing->backbone_upload_us += sched_timing.upload_us;
+        timing->backbone_compute_wait_us += sched_timing.compute_wait_us;
+    }
 
     // only the last position of each half is needed
+    const int64_t t_output = ggml_time_us();
     const size_t row = (size_t) n_embd * sizeof(float);
     sched.get(x, h_cond,   (size_t) (n_tok - 1)     * row, row);
     sched.get(x, h_uncond, (size_t) (2 * n_tok - 1) * row, row);
     sched.end();
+    if (timing) {
+        timing->backbone_output_us += ggml_time_us() - t_output;
+    }
 
     pos += n_tok;
 }
 
 // --------------------------------------------------------------- MoG sampler
 
-void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond, int32_t * code) {
+void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond, int32_t * code,
+                                   vc_tts_step_timing * timing) {
     for (int q = 0; q < n_quant; ++q) {
         code[q] = n_codebook;   // masked
     }
@@ -1039,6 +1084,7 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
             continue;
         }
 
+        const int64_t t_prepare = ggml_time_us();
         depthsum(code, ds.data());
         matvec(embed_code_w, ds.data(), ce.data(), vbuf);
         for (int j = 0; j < n_embd; ++j) {
@@ -1046,6 +1092,10 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
             xin[n_embd + j] = ce[j] + h_uncond[j];
         }
 
+        const int64_t t_build = ggml_time_us();
+        if (timing) {
+            timing->code_prepare_us += t_build - t_prepare;
+        }
         ggml_context * ctx = sched.begin();
         ggml_tensor * x = sched.input(n_embd, 2, xin.data());
         for (int i = 0; i < mog_layers; ++i) {
@@ -1066,8 +1116,18 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
         ggml_tensor * t_else   = ggml_mul_mat(ctx, mog_else_w, xg);
         // xg is read back too, so it has to be an output; the allocator would
         // hand its memory to the three head matmuls otherwise
-        sched.compute({ t_logits, t_logs, t_else, xg });
+        if (timing) {
+            timing->code_build_us += ggml_time_us() - t_build;
+        }
+        vc_sched::timing sched_timing;
+        sched.compute({ t_logits, t_logs, t_else, xg }, timing ? &sched_timing : nullptr);
+        if (timing) {
+            timing->code_alloc_us += sched_timing.alloc_us;
+            timing->code_upload_us += sched_timing.upload_us;
+            timing->code_compute_wait_us += sched_timing.compute_wait_us;
+        }
 
+        const int64_t t_output = ggml_time_us();
         std::vector<float> logits(n_pred), mu_res(n_latent), xg_h(n_embd);
         float logs_raw = 0.0f;
         sched.get(t_logits, logits.data());
@@ -1075,6 +1135,11 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
         sched.get(t_else,   mu_res.data());
         sched.get(xg,       xg_h.data());
         sched.end();
+        if (timing) {
+            timing->code_output_us += ggml_time_us() - t_output;
+        }
+
+        const int64_t t_cpu = ggml_time_us();
 
         const float logs = std::max(logs_raw, min_log_std);
 
@@ -1160,6 +1225,9 @@ void voicechat_tts::generate_codes(const float * h_cond, const float * h_uncond,
             code[q] = best_c;
         }
         cnt += k;
+        if (timing) {
+            timing->code_cpu_us += ggml_time_us() - t_cpu;
+        }
     }
 }
 
@@ -1242,7 +1310,7 @@ voicechat_tts * voicechat_tts_init(const char * fname, const char * device,
     return tts;
 }
 
-void voicechat_tts_step(voicechat_tts * tts, int32_t text_token) {
+void voicechat_tts_step(voicechat_tts * tts, int32_t text_token, vc_tts_step_timing * timing) {
     if (tts->pos + 1 > tts->n_ctx) {
         LOG_ERR("voicechat-tts: out of cache (%d frames)\n", tts->n_ctx);
         return;
@@ -1253,6 +1321,10 @@ void voicechat_tts_step(voicechat_tts * tts, int32_t text_token) {
         tts->prev_code = tts->silence;
     }
 
+    if (timing) {
+        *timing = {};
+    }
+    const int64_t t_prepare = ggml_time_us();
     std::vector<float> ds(tts->n_latent), ce(tts->n_embd);
     tts->depthsum(tts->prev_code.data(), ds.data());
     matvec(tts->embed_code_w, ds.data(), ce.data(), tts->vbuf);
@@ -1261,17 +1333,24 @@ void voicechat_tts_step(voicechat_tts * tts, int32_t text_token) {
     std::vector<float> cond((size_t) 2 * tts->n_embd);
     memcpy(code_emb.data(), ce.data(), tts->n_embd * sizeof(float));
     memcpy(code_emb.data() + tts->n_embd, ce.data(), tts->n_embd * sizeof(float));
-    tts->frame_cond(text_token, cond.data());
+    if (timing) {
+        timing->prepare_us += ggml_time_us() - t_prepare;
+    }
+    tts->frame_cond(text_token, cond.data(), timing);
     memcpy(cond.data() + tts->n_embd, tts->null_emb.data(), tts->n_embd * sizeof(float));
 
     std::vector<float> hc(tts->n_embd), hu(tts->n_embd);
-    tts->backbone_step(code_emb.data(), cond.data(), 1, nullptr, hc.data(), hu.data());
+    tts->backbone_step(code_emb.data(), cond.data(), 1, nullptr, hc.data(), hu.data(), timing);
 
     std::vector<int32_t> code(tts->n_quant);
-    tts->generate_codes(hc.data(), hu.data(), code.data());
+    tts->generate_codes(hc.data(), hu.data(), code.data(), timing);
+    const int64_t t_state = ggml_time_us();
     tts->frames.push_back(code);
     tts->frame_toks.push_back(text_token);
     tts->prev_code = code;
+    if (timing) {
+        timing->state_append_us += ggml_time_us() - t_state;
+    }
 }
 
 float voicechat_tts_silence_cos(const voicechat_tts * tts) {
@@ -1379,6 +1458,21 @@ static std::vector<float> codec_decode(voicechat_tts * tts, vc_sched & runner,
 
 int voicechat_tts_n_frames(const voicechat_tts * tts) {
     return tts ? (int) tts->frames.size() : 0;
+}
+
+uint64_t voicechat_tts_last_frame_hash(const voicechat_tts * tts) {
+    uint64_t hash = 1469598103934665603ULL;
+    if (!tts || tts->frames.empty()) {
+        return hash;
+    }
+    for (int32_t code : tts->frames.back()) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&code);
+        for (size_t i = 0; i < sizeof(code); ++i) {
+            hash ^= bytes[i];
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
 }
 
 bool voicechat_tts_write_wav(voicechat_tts * tts, const char * path, int n_skip, int n_take) {

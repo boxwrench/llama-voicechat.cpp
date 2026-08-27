@@ -11,6 +11,28 @@
 
 struct voicechat_tts;
 
+// Research-only decomposition of one native 80 ms generator step.  The
+// scheduler fields deliberately include the wait required by graph compute;
+// they are not kernel-only measurements.
+struct vc_tts_step_timing {
+    int64_t prepare_us = 0;
+    int64_t condition_us = 0;
+    int64_t backbone_build_us = 0;
+    int64_t backbone_alloc_us = 0;
+    int64_t backbone_upload_us = 0;
+    int64_t backbone_compute_wait_us = 0;
+    int64_t backbone_output_us = 0;
+    int64_t code_build_us = 0;
+    int64_t code_prepare_us = 0;
+    int64_t code_alloc_us = 0;
+    int64_t code_upload_us = 0;
+    int64_t code_compute_wait_us = 0;
+    int64_t code_output_us = 0;
+    int64_t code_cpu_us = 0;
+    int64_t state_append_us = 0;
+    bool condition_cache_hit = false;
+};
+
 // `device` names the ggml backend the graphs run on ("CUDA0", "CPU", ...);
 // nullptr or "" takes the first GPU the registry reports and falls back to the
 // cpu, and VC_TTS_DEVICE overrides it. n_frames_max sizes the backbone kv
@@ -19,7 +41,8 @@ voicechat_tts * voicechat_tts_init(const char * fname, const char * device,
                                    int n_threads, int n_frames_max, uint32_t seed);
 
 // one 80 ms frame; text_token is this frame's token on the STT text channel
-void voicechat_tts_step(voicechat_tts * tts, int32_t text_token);
+void voicechat_tts_step(voicechat_tts * tts, int32_t text_token,
+                        vc_tts_step_timing * timing = nullptr);
 
 // cosine between the last generated frame's latent and the codec silence
 // latent: ~1.0 while the speaker is quiet, well below it on any voiced frame.
@@ -30,6 +53,7 @@ float voicechat_tts_silence_cos(const voicechat_tts * tts);
 // how many frames have been generated so far; a session marks a turn by the
 // range of this counter it spans.
 int voicechat_tts_n_frames(const voicechat_tts * tts);
+uint64_t voicechat_tts_last_frame_hash(const voicechat_tts * tts);
 
 // decode frames [first, first+count) and write a 16-bit PCM wav; count < 0
 // means "to the end". `first` drops frames off the front: the system prompt
