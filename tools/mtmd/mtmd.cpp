@@ -2414,6 +2414,8 @@ struct mtmd_voicechat_d3_stream {
     std::deque<std::vector<float>> mel_rows;
     int64_t mel_base = 0;
     int64_t next_output = 0;
+    bool preencoder_only = false;
+    bool preencoder_parity = false;
 };
 
 mtmd_voicechat_d3_stream * mtmd_voicechat_d3_stream_init(mtmd_context * ctx) {
@@ -2428,6 +2430,8 @@ mtmd_voicechat_d3_stream * mtmd_voicechat_d3_stream_init(mtmd_context * ctx) {
     auto * stream = new mtmd_voicechat_d3_stream;
     stream->ctx = ctx;
     stream->frontend = frontend;
+    stream->preencoder_only = std::getenv("VC_D3_PREENCODER_ONLY") != nullptr;
+    stream->preencoder_parity = std::getenv("VC_D3_PREENC_PARITY") != nullptr;
     stream->encoder.reset(clip_voicechat_stream_init(ctx->ctx_a, ctx->n_threads));
     if (!stream->encoder || !frontend->streaming_reset(stream->frontend_state)) {
         delete stream;
@@ -2518,13 +2522,46 @@ bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
     std::vector<float> ignored, preenc;
     const int64_t t_preencoder = ggml_time_us();
     clip_encode_timing preencoder_timing;
-    if (!clip_image_batch_encode_with_preenc(stream->ctx->ctx_a, stream->ctx->n_threads,
-                                              &batch, ignored, preenc,
-                                              timing ? &preencoder_timing : nullptr) ||
+    const auto encode_preencoder = [&](bool preencoder_only, std::vector<float> & out,
+                                       clip_encode_timing * out_timing) {
+        return preencoder_only
+            ? clip_image_batch_encode_voicechat_preencoder(stream->ctx->ctx_a, stream->ctx->n_threads,
+                                                            &batch, out, out_timing)
+            : clip_image_batch_encode_with_preenc(stream->ctx->ctx_a, stream->ctx->n_threads,
+                                                   &batch, ignored, out, out_timing);
+    };
+    if (!encode_preencoder(stream->preencoder_only, preenc,
+                           timing ? &preencoder_timing : nullptr) ||
         preenc.empty() || preenc.size() % (size_t) (local_target + 1) != 0) {
         return false;
     }
-    const int64_t t_encoded = ggml_time_us();
+    if (stream->preencoder_parity) {
+        std::vector<float> reference;
+        if (!encode_preencoder(!stream->preencoder_only, reference, nullptr) ||
+            reference.size() != preenc.size()) {
+            return false;
+        }
+        double dot = 0.0, ref_norm = 0.0, got_norm = 0.0, sq = 0.0;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < preenc.size(); ++i) {
+            const double a = reference[i];
+            const double b = preenc[i];
+            dot += a * b;
+            ref_norm += a * a;
+            got_norm += b * b;
+            const float diff = std::abs((float) (a - b));
+            sq += (double) diff * diff;
+            max_abs = std::max(max_abs, diff);
+        }
+        if (timing) {
+            timing->preencoder_bitwise_equal = std::memcmp(reference.data(), preenc.data(),
+                preenc.size() * sizeof(float)) == 0;
+            timing->preencoder_cosine = ref_norm > 0.0 && got_norm > 0.0
+                ? (float) (dot / std::sqrt(ref_norm * got_norm)) : 0.0f;
+            timing->preencoder_rmse = (float) std::sqrt(sq / preenc.size());
+            timing->preencoder_max_abs = max_abs;
+        }
+    }
     const size_t preenc_width = preenc.size() / (size_t) (local_target + 1);
     if (preenc_width != 1024 || embedding_capacity < (size_t) clip_n_mmproj_embd(stream->ctx->ctx_a)) {
         return false;
@@ -2547,6 +2584,8 @@ bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
     }
     const int64_t t_finished = ggml_time_us();
     if (timing) {
+        timing->preencoder_graph_nodes = preencoder_timing.graph_nodes;
+        timing->preencoder_only = stream->preencoder_only;
         timing->pcm_mel_us = t_mel - t_frontend;
         timing->preencoder_prepare_us = t_preencoder - t_prepare;
         timing->preencoder_graph_build_us = preencoder_timing.graph_build_us;
@@ -2576,6 +2615,36 @@ size_t mtmd_voicechat_d3_stream_state_bytes(const mtmd_voicechat_d3_stream * str
         bytes += row.size() * sizeof(float);
     }
     return bytes;
+}
+
+uint64_t mtmd_voicechat_d3_stream_state_hash(const mtmd_voicechat_d3_stream * stream) {
+    if (stream == nullptr) {
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    auto add = [&hash](const void * data, size_t n) {
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < n; ++i) {
+            hash ^= bytes[i];
+            hash *= 1099511628211ULL;
+        }
+    };
+    add(&stream->mel_base, sizeof(stream->mel_base));
+    add(&stream->next_output, sizeof(stream->next_output));
+    add(&stream->frontend_state.base_index, sizeof(stream->frontend_state.base_index));
+    add(&stream->frontend_state.n_received, sizeof(stream->frontend_state.n_received));
+    add(&stream->frontend_state.previous_raw, sizeof(stream->frontend_state.previous_raw));
+    add(&stream->frontend_state.have_previous_raw, sizeof(stream->frontend_state.have_previous_raw));
+    add(&stream->frontend_state.next_frame, sizeof(stream->frontend_state.next_frame));
+    for (float value : stream->frontend_state.preprocessed) {
+        add(&value, sizeof(value));
+    }
+    for (const auto & row : stream->mel_rows) {
+        add(row.data(), row.size() * sizeof(float));
+    }
+    const uint64_t encoder_hash = clip_voicechat_stream_state_hash(stream->encoder.get());
+    add(&encoder_hash, sizeof(encoder_hash));
+    return hash;
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {

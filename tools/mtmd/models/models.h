@@ -397,6 +397,15 @@ struct clip_graph_parakeet : clip_graph {
 struct clip_graph_voicechat : clip_graph {
     clip_graph_voicechat(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    ggml_tensor * build_preencoder();
+};
+
+// D3 consumes `pre_enc_out` and advances the encoder through a distinct
+// bounded-state graph. Keep this builder at the preencoder effect boundary.
+struct clip_graph_voicechat_preencoder final : clip_graph_voicechat {
+    clip_graph_voicechat_preencoder(clip_ctx * ctx, const clip_image_f32 & img)
+        : clip_graph_voicechat(ctx, img) {}
+    ggml_cgraph * build() override;
 };
 
 struct clip_graph_exaone4_5 : clip_graph {

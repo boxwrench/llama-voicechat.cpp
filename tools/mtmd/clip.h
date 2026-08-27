@@ -93,10 +93,15 @@ bool clip_image_batch_encode_with_preenc(struct clip_ctx * ctx, int n_threads,
         std::vector<float> & out_batch_embd,
         std::vector<float> & out_preenc,
         struct clip_encode_timing * timing = nullptr);
+bool clip_image_batch_encode_voicechat_preencoder(struct clip_ctx * ctx, int n_threads,
+        const struct clip_image_f32_batch * imgs,
+        std::vector<float> & out_preenc,
+        struct clip_encode_timing * timing = nullptr);
 
 // Measurement-only breakdown for a projector invocation.  Callers may omit
 // this; the normal encode path and its math are unchanged.
 struct clip_encode_timing {
+    int32_t graph_nodes = 0;
     int64_t graph_build_us = 0;
     int64_t graph_alloc_us = 0;
     int64_t input_us = 0;
@@ -120,6 +125,7 @@ bool clip_voicechat_stream_step(struct clip_voicechat_stream * stream,
         const float * preenc, std::vector<float> & out_embd,
         struct clip_voicechat_stream_timing * timing = nullptr);
 size_t clip_voicechat_stream_state_bytes(const struct clip_voicechat_stream * stream);
+uint64_t clip_voicechat_stream_state_hash(const struct clip_voicechat_stream * stream);
 
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
@@ -132,6 +138,7 @@ struct clip_encode_params {
     std::vector<float> * out_embd = nullptr;
     std::vector<float> * out_voicechat_preenc = nullptr;
     clip_encode_timing * timing = nullptr; // optional measurement-only breakdown
+    bool voicechat_preencoder_only = false;
 
     // for audio gen, imgs has exactly one entry: hidden state from backbone (GEN_CODE) or unused (GEN_WAV)
     clip_gen_process_type gen_process = CLIP_GEN_PROCESS_GEN_UNKNOWN;

@@ -1127,6 +1127,27 @@ size_t clip_voicechat_stream_state_bytes(const clip_voicechat_stream * stream) {
     return bytes;
 }
 
+uint64_t clip_voicechat_stream_state_hash(const clip_voicechat_stream * stream) {
+    if (stream == nullptr) {
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    auto add = [&hash](const void * data, size_t n) {
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < n; ++i) {
+            hash ^= bytes[i];
+            hash *= 1099511628211ULL;
+        }
+    };
+    add(&stream->step_index, sizeof(stream->step_index));
+    for (int il = 0; il < stream->n_layer; ++il) {
+        add(stream->k_hist[il].data(), stream->k_hist[il].size() * sizeof(float));
+        add(stream->v_hist[il].data(), stream->v_hist[il].size() * sizeof(float));
+        add(stream->conv_hist[il].data(), stream->conv_hist[il].size() * sizeof(float));
+    }
+    return hash;
+}
+
 bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * preenc,
                                 std::vector<float> & out_embd,
                                 clip_voicechat_stream_timing * timing) {
@@ -1471,7 +1492,11 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             } break;
         case PROJECTOR_TYPE_VOICECHAT:
             {
-                builder = std::make_unique<clip_graph_voicechat>(ctx, img);
+                if (params && params->voicechat_preencoder_only) {
+                    builder = std::make_unique<clip_graph_voicechat_preencoder>(ctx, img);
+                } else {
+                    builder = std::make_unique<clip_graph_voicechat>(ctx, img);
+                }
             } break;
         case PROJECTOR_TYPE_GRANITE4_VISION:
             {
@@ -4700,6 +4725,21 @@ bool clip_image_batch_encode_with_preenc(clip_ctx * ctx, int n_threads, const cl
     return clip_encode(ctx, &params);
 }
 
+bool clip_image_batch_encode_voicechat_preencoder(clip_ctx * ctx, int n_threads,
+                                                   const clip_image_f32_batch * imgs_c_ptr,
+                                                   std::vector<float> & out_preenc,
+                                                   clip_encode_timing * timing) {
+    std::vector<float> ignored;
+    clip_encode_params params;
+    params.imgs = imgs_c_ptr;
+    params.n_threads = n_threads;
+    params.out_embd = &ignored;
+    params.out_voicechat_preenc = &out_preenc;
+    params.timing = timing;
+    params.voicechat_preencoder_only = true;
+    return clip_encode(ctx, &params);
+}
+
 // persisted state slots of the gen-audio decoder, per pipeline
 static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hparams, const clip_model & model) {
     switch (model.proj_type) {
@@ -5869,6 +5909,16 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_VOICECHAT:
             {
                 GGML_ASSERT(imgs.entries.size() == 1);
+
+                // The D3 effect-boundary probe intentionally terminates the
+                // graph at pre_enc_out.  None of the encoder-only inputs
+                // below exist in that graph, and none carry state required by
+                // the persistent bounded encoder step that consumes this
+                // output separately.
+                if (params->voicechat_preencoder_only) {
+                    break;
+                }
+
                 ggml_tensor * attn_mask = ggml_graph_get_tensor(gf, "attn_mask");
                 const int   n_q        = attn_mask->ne[1];
                 const int   n_k        = attn_mask->ne[0];
@@ -6202,6 +6252,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     if (params->timing) {
         const int64_t timing_finished = ggml_time_us();
+        params->timing->graph_nodes = ggml_graph_n_nodes(gf);
         params->timing->graph_build_us = timing_built - timing_total;
         params->timing->graph_alloc_us = timing_allocated - timing_built;
         params->timing->input_us = timing_inputs - timing_allocated;

@@ -15,8 +15,7 @@
 // The output is one 4480-wide vector per 80 ms, ready to be added to the STT
 // LLM's token embeddings.
 
-ggml_cgraph * clip_graph_voicechat::build() {
-    const auto & hparams = model.hparams;
+ggml_tensor * clip_graph_voicechat::build_preencoder() {
 
     // left and right pad of NeMo CausalConv2D(kernel 3, stride 2)
     const int sub_lp = 2;
@@ -59,6 +58,19 @@ ggml_cgraph * clip_graph_voicechat::build() {
     cur = build_mm(model.pre_encode_out_w, cur);
     cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
     ggml_set_name(cur, "pre_enc_out");
+
+    return cur;
+}
+
+ggml_cgraph * clip_graph_voicechat_preencoder::build() {
+    ggml_tensor * cur = build_preencoder();
+    ggml_build_forward_expand(gf, cur);
+    return gf;
+}
+
+ggml_cgraph * clip_graph_voicechat::build() {
+    const auto & hparams = model.hparams;
+    ggml_tensor * cur = build_preencoder();
 
     // encoder
 

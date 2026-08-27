@@ -355,6 +355,12 @@ MTMD_API bool mtmd_voicechat_d2_streaming_frontend(
 // must not advance it when `embedding_ready` is false.
 struct mtmd_voicechat_d3_stream;
 struct mtmd_voicechat_d3_timing {
+    int32_t preencoder_graph_nodes;
+    bool    preencoder_only;
+    bool    preencoder_bitwise_equal;
+    float   preencoder_cosine;
+    float   preencoder_rmse;
+    float   preencoder_max_abs;
     int64_t pcm_mel_us;
     int64_t preencoder_prepare_us;
     int64_t preencoder_graph_build_us;
@@ -382,6 +388,7 @@ MTMD_API bool mtmd_voicechat_d3_stream_step(struct mtmd_voicechat_d3_stream * st
 // current frontend overlap, and causal preencoder rows. Intended for live
 // telemetry; it excludes model weights and allocator capacity.
 MTMD_API size_t mtmd_voicechat_d3_stream_state_bytes(const struct mtmd_voicechat_d3_stream * stream);
+MTMD_API uint64_t mtmd_voicechat_d3_stream_state_hash(const struct mtmd_voicechat_d3_stream * stream);
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:

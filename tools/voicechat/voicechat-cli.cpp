@@ -1182,11 +1182,26 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
     const vc_async_metrics rm = async_renderer ? async_renderer->snapshot() : vc_async_metrics{};
     const int64_t total = m1 - p0;
     const size_t d3_state_bytes = mtmd_voicechat_d3_stream_state_bytes(d3_stream.get());
+    const uint64_t d3_state_hash = mtmd_voicechat_d3_stream_state_hash(d3_stream.get());
+    uint64_t embedding_hash = 1469598103934665603ULL;
+    for (float value : embedding) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
+        for (size_t i = 0; i < sizeof(value); ++i) {
+            embedding_hash ^= bytes[i];
+            embedding_hash *= 1099511628211ULL;
+        }
+    }
     telemetry = json{{"kind", "d3_frame"}, {"capture_us", capture_us},
                      {"timeline_frame", frame_id}, {"perception_start_us", p0},
                      {"perception_end_us", p1}, {"main_start_us", m0}, {"main_end_us", m1},
                      {"d2_pcm_mel_us", perception_timing.pcm_mel_us},
                      {"d2_preencoder_prepare_us", perception_timing.preencoder_prepare_us},
+                     {"d2_preencoder_graph_nodes", perception_timing.preencoder_graph_nodes},
+                     {"d2_preencoder_only", perception_timing.preencoder_only},
+                     {"d2_preencoder_bitwise_equal", perception_timing.preencoder_bitwise_equal},
+                     {"d2_preencoder_cosine", perception_timing.preencoder_cosine},
+                     {"d2_preencoder_rmse", perception_timing.preencoder_rmse},
+                     {"d2_preencoder_max_abs", perception_timing.preencoder_max_abs},
                      {"d2_preencoder_graph_build_us", perception_timing.preencoder_graph_build_us},
                      {"d2_preencoder_graph_alloc_us", perception_timing.preencoder_graph_alloc_us},
                      {"d2_preencoder_input_us", perception_timing.preencoder_input_us},
@@ -1201,7 +1216,8 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
                      {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
                      {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
                      {"function_token", last_func}, {"function_head_gpu", fhead.gpu},
-                     {"d3_state_bytes", d3_state_bytes},
+                     {"d3_state_bytes", d3_state_bytes}, {"d3_state_hash", d3_state_hash},
+                     {"d3_embedding_hash", embedding_hash},
                      {"timeline_backlog", 0}, {"deadline_miss_80ms", total > 80000},
                      {"frame_total_us", total}};
     return true;
