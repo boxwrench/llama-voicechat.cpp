@@ -235,6 +235,13 @@ struct function_head {
     // backend is available -- never a hard failure.
     void open_gpu(ggml_tensor * W) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        // A discrete HIP card registers as GPU, while Strix Halo's gfx1151
+        // registers as IGPU.  This is the same preference order used by
+        // ggml_backend_init_best(); the function-head graph is portable across
+        // both classes and must not silently lose acceleration on an iGPU.
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
         if (!dev) {
             LOG_ERR("%s: VC_FHEAD_GPU set but no GPU backend device found, staying on cpu\n", __func__);
             return;
@@ -1178,6 +1185,7 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
                      {"perception_end_us", p1}, {"main_start_us", m0}, {"main_end_us", m1},
                      {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
                      {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
+                     {"function_token", last_func}, {"function_head_gpu", fhead.gpu},
                      {"d3_state_bytes", d3_state_bytes},
                      {"timeline_backlog", 0}, {"deadline_miss_80ms", total > 80000},
                      {"frame_total_us", total}};
