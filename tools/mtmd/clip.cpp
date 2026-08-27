@@ -1128,7 +1128,8 @@ size_t clip_voicechat_stream_state_bytes(const clip_voicechat_stream * stream) {
 }
 
 bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * preenc,
-                                std::vector<float> & out_embd) {
+                                std::vector<float> & out_embd,
+                                clip_voicechat_stream_timing * timing) {
     if (stream == nullptr || preenc == nullptr) {
         return false;
     }
@@ -1216,6 +1217,14 @@ bool clip_voicechat_stream_step(clip_voicechat_stream * stream, const float * pr
                     std::min(conv_frame, next_conv[il].size()) * sizeof(float));
     }
     const int64_t t_finished = ggml_time_us();
+    if (timing) {
+        timing->graph_build_us = t_built - t_build;
+        timing->graph_alloc_us = t_allocated - t_built;
+        timing->input_us = t_inputs - t_allocated;
+        timing->compute_us = t_computed - t_inputs;
+        timing->output_state_us = t_finished - t_computed;
+        timing->total_us = t_finished - t_total;
+    }
     if (decompose) {
         LOG_INF("D2DECOMP step=%" PRId64 " hist=%d build_us=%" PRId64
                 " alloc_us=%" PRId64 " input_us=%" PRId64 " compute_us=%" PRId64
@@ -4679,12 +4688,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 }
 
 bool clip_image_batch_encode_with_preenc(clip_ctx * ctx, int n_threads, const clip_image_f32_batch * imgs_c_ptr,
-                                         std::vector<float> & out_batch_embd, std::vector<float> & out_preenc) {
+                                         std::vector<float> & out_batch_embd, std::vector<float> & out_preenc,
+                                         clip_encode_timing * timing) {
     clip_encode_params params;
     params.imgs = imgs_c_ptr;
     params.n_threads = n_threads;
     params.out_embd = &out_batch_embd;
     params.out_voicechat_preenc = &out_preenc;
+    params.timing = timing;
 
     return clip_encode(ctx, &params);
 }
@@ -4699,6 +4710,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    const int64_t timing_total = params->timing ? ggml_time_us() : 0;
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4722,6 +4734,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     ggml_backend_sched_reset(ctx->sched.get());
     auto graph_builder = clip_get_graph_builder(ctx, imgs, params);
     ggml_cgraph * gf = graph_builder->build();
+    const int64_t timing_built = params->timing ? ggml_time_us() : 0;
 
     // Research callers need intermediate VoiceChat tensors to remain live
     // through compute; otherwise the allocator may reuse their buffers after
@@ -4737,6 +4750,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    const int64_t timing_allocated = params->timing ? ggml_time_us() : 0;
 
     // set inputs
     const auto & model   = ctx->model;
@@ -6017,11 +6031,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
+    const int64_t timing_inputs = params->timing ? ggml_time_us() : 0;
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
     }
+    const int64_t timing_computed = params->timing ? ggml_time_us() : 0;
 
     if (params->out_voicechat_preenc != nullptr) {
         auto & out_preenc = *params->out_voicechat_preenc;
@@ -6184,6 +6200,15 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         LOG_INF("=== END MTMD_DEBUG_EMBEDDINGS ===\n\n");
     }
 
+    if (params->timing) {
+        const int64_t timing_finished = ggml_time_us();
+        params->timing->graph_build_us = timing_built - timing_total;
+        params->timing->graph_alloc_us = timing_allocated - timing_built;
+        params->timing->input_us = timing_inputs - timing_allocated;
+        params->timing->compute_us = timing_computed - timing_inputs;
+        params->timing->output_us = timing_finished - timing_computed;
+        params->timing->total_us = timing_finished - timing_total;
+    }
     return true;
 }
 

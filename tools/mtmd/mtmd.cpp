@@ -2453,16 +2453,23 @@ bool mtmd_voicechat_d3_stream_reset(mtmd_voicechat_d3_stream * stream) {
 
 bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
         const float * samples, size_t n_samples, float * embedding_out,
-        size_t embedding_capacity, bool * embedding_ready) {
+        size_t embedding_capacity, bool * embedding_ready,
+        mtmd_voicechat_d3_timing * timing) {
     if (stream == nullptr || samples == nullptr || embedding_out == nullptr ||
         embedding_ready == nullptr) {
         return false;
     }
     *embedding_ready = false;
+    if (timing) {
+        *timing = {};
+    }
+    const int64_t t_total = ggml_time_us();
     mtmd_audio_mel emitted;
+    const int64_t t_frontend = ggml_time_us();
     if (!stream->frontend->streaming_push(stream->frontend_state, samples, n_samples, emitted)) {
         return false;
     }
+    const int64_t t_mel = ggml_time_us();
     for (int64_t frame = 0; frame < emitted.n_len; ++frame) {
         std::vector<float> row((size_t) emitted.n_mel);
         for (int mel = 0; mel < emitted.n_mel; ++mel) {
@@ -2471,14 +2478,23 @@ bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
         stream->mel_rows.push_back(std::move(row));
     }
     if (stream->mel_rows.empty()) {
+        if (timing) {
+            timing->pcm_mel_us = t_mel - t_frontend;
+            timing->total_us = ggml_time_us() - t_total;
+        }
         return true;
     }
 
     const int64_t last_mel = stream->mel_base + (int64_t) stream->mel_rows.size() - 1;
     const int64_t target_mel = 8 * stream->next_output;
     if (last_mel < target_mel) {
+        if (timing) {
+            timing->pcm_mel_us = t_mel - t_frontend;
+            timing->total_us = ggml_time_us() - t_total;
+        }
         return true;
     }
+    const int64_t t_prepare = ggml_time_us();
     const int64_t first_mel = stream->next_output < 4 ? 0 : 8 * (stream->next_output - 4);
     const int window_frames = (int) (target_mel - first_mel + 1);
     const int local_target = std::min<int64_t>(stream->next_output, 4);
@@ -2500,27 +2516,51 @@ bool mtmd_voicechat_d3_stream_step(mtmd_voicechat_d3_stream * stream,
     batch.is_audio = true;
     batch.entries.push_back(std::move(image));
     std::vector<float> ignored, preenc;
+    const int64_t t_preencoder = ggml_time_us();
+    clip_encode_timing preencoder_timing;
     if (!clip_image_batch_encode_with_preenc(stream->ctx->ctx_a, stream->ctx->n_threads,
-                                              &batch, ignored, preenc) ||
+                                              &batch, ignored, preenc,
+                                              timing ? &preencoder_timing : nullptr) ||
         preenc.empty() || preenc.size() % (size_t) (local_target + 1) != 0) {
         return false;
     }
+    const int64_t t_encoded = ggml_time_us();
     const size_t preenc_width = preenc.size() / (size_t) (local_target + 1);
     if (preenc_width != 1024 || embedding_capacity < (size_t) clip_n_mmproj_embd(stream->ctx->ctx_a)) {
         return false;
     }
     std::vector<float> projected;
+    clip_voicechat_stream_timing encoder_timing;
     if (!clip_voicechat_stream_step(stream->encoder.get(),
                                     preenc.data() + (size_t) local_target * preenc_width,
-                                    projected) || projected.size() > embedding_capacity) {
+                                    projected, timing ? &encoder_timing : nullptr) ||
+        projected.size() > embedding_capacity) {
         return false;
     }
+    const int64_t t_encoder = ggml_time_us();
     std::memcpy(embedding_out, projected.data(), projected.size() * sizeof(float));
     ++stream->next_output;
     const int64_t keep_from = stream->next_output < 4 ? 0 : 8 * (stream->next_output - 4);
     while (!stream->mel_rows.empty() && stream->mel_base < keep_from) {
         stream->mel_rows.pop_front();
         ++stream->mel_base;
+    }
+    const int64_t t_finished = ggml_time_us();
+    if (timing) {
+        timing->pcm_mel_us = t_mel - t_frontend;
+        timing->preencoder_prepare_us = t_preencoder - t_prepare;
+        timing->preencoder_graph_build_us = preencoder_timing.graph_build_us;
+        timing->preencoder_graph_alloc_us = preencoder_timing.graph_alloc_us;
+        timing->preencoder_input_us = preencoder_timing.input_us;
+        timing->preencoder_compute_us = preencoder_timing.compute_us;
+        timing->preencoder_output_us = preencoder_timing.output_us;
+        timing->encoder_graph_build_us = encoder_timing.graph_build_us;
+        timing->encoder_graph_alloc_us = encoder_timing.graph_alloc_us;
+        timing->encoder_input_us = encoder_timing.input_us;
+        timing->encoder_compute_us = encoder_timing.compute_us;
+        timing->encoder_output_state_us = encoder_timing.output_state_us;
+        timing->state_cache_us = t_finished - t_encoder;
+        timing->total_us = t_finished - t_total;
     }
     *embedding_ready = true;
     return true;

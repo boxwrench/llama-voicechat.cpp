@@ -354,13 +354,30 @@ MTMD_API bool mtmd_voicechat_d2_streaming_frontend(
 // one projected VoiceChat embedding. The caller owns timeline advancement and
 // must not advance it when `embedding_ready` is false.
 struct mtmd_voicechat_d3_stream;
+struct mtmd_voicechat_d3_timing {
+    int64_t pcm_mel_us;
+    int64_t preencoder_prepare_us;
+    int64_t preencoder_graph_build_us;
+    int64_t preencoder_graph_alloc_us;
+    int64_t preencoder_input_us;
+    int64_t preencoder_compute_us;
+    int64_t preencoder_output_us;
+    int64_t encoder_graph_build_us;
+    int64_t encoder_graph_alloc_us;
+    int64_t encoder_input_us;
+    int64_t encoder_compute_us;
+    int64_t encoder_output_state_us;
+    int64_t state_cache_us;
+    int64_t total_us;
+};
 MTMD_API struct mtmd_voicechat_d3_stream * mtmd_voicechat_d3_stream_init(
         mtmd_context * ctx);
 MTMD_API void mtmd_voicechat_d3_stream_free(struct mtmd_voicechat_d3_stream * stream);
 MTMD_API bool mtmd_voicechat_d3_stream_reset(struct mtmd_voicechat_d3_stream * stream);
 MTMD_API bool mtmd_voicechat_d3_stream_step(struct mtmd_voicechat_d3_stream * stream,
         const float * samples, size_t n_samples, float * embedding_out,
-        size_t embedding_capacity, bool * embedding_ready);
+        size_t embedding_capacity, bool * embedding_ready,
+        struct mtmd_voicechat_d3_timing * timing = nullptr);
 // Logical dynamic state retained by the D3 live path: bounded encoder history,
 // current frontend overlap, and causal preencoder rows. Intended for live
 // telemetry; it excludes model weights and allocator capacity.

@@ -1161,15 +1161,17 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
     const int64_t frame_id = t;
     std::vector<float> embedding((size_t) n_embd);
     bool ready = false;
+    mtmd_voicechat_d3_timing perception_timing{};
     const int64_t p0 = ggml_time_us();
     if (!mtmd_voicechat_d3_stream_step(d3_stream.get(), samples, n_samples,
-                                       embedding.data(), embedding.size(), &ready)) {
+                                       embedding.data(), embedding.size(), &ready, &perception_timing)) {
         return false;
     }
     const int64_t p1 = ggml_time_us();
     if (!ready) {
         telemetry = json{{"kind", "d3_frame_wait"}, {"capture_us", capture_us},
-                         {"timeline_frame", frame_id}, {"perception_us", p1 - p0}};
+                         {"timeline_frame", frame_id}, {"perception_us", p1 - p0},
+                         {"d2_pcm_mel_us", perception_timing.pcm_mel_us}};
         return true;
     }
     const int64_t m0 = ggml_time_us();
@@ -1183,6 +1185,19 @@ bool vc_session::d3_step(const float * samples, size_t n_samples, int64_t captur
     telemetry = json{{"kind", "d3_frame"}, {"capture_us", capture_us},
                      {"timeline_frame", frame_id}, {"perception_start_us", p0},
                      {"perception_end_us", p1}, {"main_start_us", m0}, {"main_end_us", m1},
+                     {"d2_pcm_mel_us", perception_timing.pcm_mel_us},
+                     {"d2_preencoder_prepare_us", perception_timing.preencoder_prepare_us},
+                     {"d2_preencoder_graph_build_us", perception_timing.preencoder_graph_build_us},
+                     {"d2_preencoder_graph_alloc_us", perception_timing.preencoder_graph_alloc_us},
+                     {"d2_preencoder_input_us", perception_timing.preencoder_input_us},
+                     {"d2_preencoder_compute_us", perception_timing.preencoder_compute_us},
+                     {"d2_preencoder_output_us", perception_timing.preencoder_output_us},
+                     {"d2_encoder_graph_build_us", perception_timing.encoder_graph_build_us},
+                     {"d2_encoder_graph_alloc_us", perception_timing.encoder_graph_alloc_us},
+                     {"d2_encoder_input_us", perception_timing.encoder_input_us},
+                     {"d2_encoder_compute_us", perception_timing.encoder_compute_us},
+                     {"d2_encoder_output_state_us", perception_timing.encoder_output_state_us},
+                     {"d2_state_cache_us", perception_timing.state_cache_us},
                      {"tts_publish_us", rm.published_us}, {"renderer_start_us", rm.render_start_us},
                      {"renderer_first_pcm_us", rm.first_pcm_us}, {"pcm_max_samples", rm.max_ring_samples},
                      {"function_token", last_func}, {"function_head_gpu", fhead.gpu},
